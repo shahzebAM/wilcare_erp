@@ -1,4 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { getApiAuthHeaders } from '../lib/apiSession';
+import { roundSalesLine, salesTotals } from '../lib/salesAmounts';
+import { useInvisibleScanner } from '../lib/useInvisibleScanner';
+import './order-entry-workspace.css';
 
 // --- INTERFACES ---
 interface Customer { id: string; company: string; name: string; contact: string | null; phone: string | null; email: string | null; address: string | null; category?: string; }
@@ -14,9 +18,11 @@ interface CreateOSModuleProps {
   onViewLedger?: () => void;
   setActiveTab?: (tab: string) => void;
   initialCustomerId?: string | null;
+  canApprove?: boolean;
+  onOpenFulfillment?: () => void;
 }
 
-export default function CreateOSModule({ selectedCompany, loginUsername, API_BASE_URL, onBack, onViewLedger, initialCustomerId, setActiveTab }: CreateOSModuleProps) {
+export default function CreateOSModule({ selectedCompany, loginUsername, API_BASE_URL, onBack, onViewLedger, initialCustomerId, setActiveTab, canApprove = false, onOpenFulfillment }: CreateOSModuleProps) {
   const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isRefreshingStock, setIsRefreshingStock] = useState(false);
@@ -25,14 +31,20 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
   const [isGeneratingFinalOrder, setIsGeneratingFinalOrder] = useState(false);
   const [finalOrderGenerated, setFinalOrderGenerated] = useState(false);
   const [finalOrderNumber, setFinalOrderNumber] = useState(''); 
+  const foNumberRequestRef = useRef(0);
 
   // --- DATA STATES ---
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [allSlips, setAllSlips] = useState<any[]>([]);
   const [productSearchResults, setProductSearchResults] = useState<SearchedProduct[]>([]);
   
+  // --- NEW SCANNER STATES ---
+  const [allProducts, setAllProducts] = useState<any[]>([]);
+
   // Editable OS Number & Reference & Update Tracker
   const [osNumber, setOsNumber] = useState<string>('');
+  const osNumberRequestRef = useRef(0);
+  const [docType, setDocType] = useState<'OS' | 'QT'>('OS');
   const [referenceOs, setReferenceOs] = useState<string | null>(null);
   const [loadedOsId, setLoadedOsId] = useState<string | null>(null);
   const [loadedOsStatus, setLoadedOsStatus] = useState<string>('Generated');
@@ -63,56 +75,53 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
 
   const showToast = (msg: string, type: 'success' | 'error') => { setToast({ message: msg, type }); setTimeout(() => setToast(null), 3500); };
 
-  const fetchNextOsNumber = useCallback(async () => {
+  const fetchNextOsNumber = useCallback(async (signal?: AbortSignal) => {
+    const request = ++osNumberRequestRef.current;
     try {
-      const res = await fetch(`${API_BASE_URL}/sales/order-slips?company=${encodeURIComponent(selectedCompany)}&limit=500`);
+      const endpoint = docType === 'QT' ? 'quotations' : 'order-slips';
+      const res = await fetch(`${API_BASE_URL}/sales/${endpoint}/next-number?company=${encodeURIComponent(selectedCompany)}&type=${docType}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany }, signal });
+      if (!res.ok) throw new Error('Could not load the next document number.');
       const data = await res.json();
-      const slips = data.data || [];
-      
-      setAllSlips(slips);
+      if (!signal?.aborted && request === osNumberRequestRef.current) setOsNumber(docType === 'QT' ? data.qtNumber : data.osNumber);
+    } catch {
+      if (!signal?.aborted && request === osNumberRequestRef.current) setOsNumber(`${docType}-000001`);
+    }
+  }, [selectedCompany, API_BASE_URL, docType]);
 
-      const osSlips = slips.filter((s: any) => s.osNumber && s.osNumber.startsWith('OS'));
-      osSlips.sort((a: any, b: any) => parseInt(b.osNumber.replace(/\D/g, '') || '0', 10) - parseInt(a.osNumber.replace(/\D/g, '') || '0', 10));
-
-      const lastOs = osSlips.length > 0 ? osSlips[0] : null;
-      if (lastOs) {
-        const match = lastOs.osNumber.match(/(\d+)$/); 
-        if (match) {
-          const nextNum = parseInt(match[0], 10) + 1;
-          const prefix = lastOs.osNumber.substring(0, match.index);
-          const padding = match[0].length;
-          setOsNumber(`${prefix}${String(nextNum).padStart(padding, '0')}`);
-        } else setOsNumber('OS-000001');
-      } else setOsNumber('OS-000001');
-    } catch (e) { setOsNumber('OS-000001'); }
+  const fetchNextFoNumber = useCallback(async (signal?: AbortSignal) => {
+    const request = ++foNumberRequestRef.current;
+    try {
+      const res = await fetch(`${API_BASE_URL}/sales/order-slips/next-number?company=${encodeURIComponent(selectedCompany)}&type=FO`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany }, signal });
+      if (!res.ok) throw new Error('Could not load the next Final Order number.');
+      const data = await res.json();
+      if (!signal?.aborted && request === foNumberRequestRef.current) setFinalOrderNumber(data.osNumber);
+    } catch {
+      if (!signal?.aborted && request === foNumberRequestRef.current) setFinalOrderNumber('FO-000001');
+    }
   }, [selectedCompany, API_BASE_URL]);
 
-  const fetchNextFoNumber = useCallback(async () => {
+  const fetchSlipHistory = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE_URL}/sales/order-slips?company=${encodeURIComponent(selectedCompany)}&limit=500`);
-      const data = await res.json();
-      const slips = data.data || [];
-      
-      const foSlips = slips.filter((s: any) => s.osNumber && s.osNumber.startsWith('FO'));
-      foSlips.sort((a: any, b: any) => parseInt(b.osNumber.replace(/\D/g, '') || '0', 10) - parseInt(a.osNumber.replace(/\D/g, '') || '0', 10));
-
-      const lastFo = foSlips.length > 0 ? foSlips[0] : null;
-      if (lastFo) {
-        const match = lastFo.osNumber.match(/(\d+)$/); 
-        if (match) {
-          const nextNum = parseInt(match[0], 10) + 1;
-          const prefix = lastFo.osNumber.substring(0, match.index);
-          const padding = match[0].length;
-          setFinalOrderNumber(`${prefix}${String(nextNum).padStart(padding, '0')}`);
-        } else setFinalOrderNumber('FO-000001');
-      } else setFinalOrderNumber('FO-000001');
-    } catch (e) { setFinalOrderNumber('FO-000001'); }
+      const res = await fetch(`${API_BASE_URL}/sales/order-slips?company=${encodeURIComponent(selectedCompany)}&limit=500`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } });
+      if (res.ok) {
+        const data = await res.json();
+        setAllSlips(data.data || []);
+      }
+    } catch {
+      // Existing templates remain available when a refresh fails.
+    }
   }, [selectedCompany, API_BASE_URL]);
-
-  useEffect(() => { fetchNextOsNumber(); fetchNextFoNumber(); }, [fetchNextOsNumber, fetchNextFoNumber]);
 
   useEffect(() => {
-    fetch(`${API_BASE_URL}/sales/customers?company=${selectedCompany}&limit=100`)
+    const controller = new AbortController();
+    fetchNextOsNumber(controller.signal);
+    fetchNextFoNumber(controller.signal);
+    fetchSlipHistory();
+    return () => controller.abort();
+  }, [fetchNextOsNumber, fetchNextFoNumber, fetchSlipHistory]);
+
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/sales/customers?company=${selectedCompany}&limit=100`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } })
       .then(res => res.json())
       .then(data => {
         const list = Array.isArray(data) ? data : (data.data || []);
@@ -128,12 +137,21 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
       }).catch(() => {});
   }, [selectedCompany, API_BASE_URL, initialCustomerId]);
 
+
+  // --- FETCH CATALOG FOR INSTANT SCANNING ---
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/sales/order-slips/all-products?company=${encodeURIComponent(selectedCompany)}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } })
+      .then(res => res.json())
+      .then(data => setAllProducts(data || []))
+      .catch(() => {});
+  }, [selectedCompany, API_BASE_URL]);
+
   useEffect(() => {
     if (productSearch.trim().length < 2) { setProductSearchResults([]); setHighlightedIndex(-1); return; }
     const handler = setTimeout(async () => {
       setIsSearchingProducts(true);
       try {
-        const res = await fetch(`${API_BASE_URL}/sales/order-slips/search-products?company=${selectedCompany}&q=${encodeURIComponent(productSearch)}`);
+        const res = await fetch(`${API_BASE_URL}/sales/order-slips/search-products?company=${selectedCompany}&q=${encodeURIComponent(productSearch)}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } });
         if (res.ok) { setProductSearchResults(await res.json()); setHighlightedIndex(-1); }
       } catch (e) {} finally { setIsSearchingProducts(false); }
     }, 50);
@@ -161,7 +179,7 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
 
     if (customer.category && customer.category !== 'General') {
       try {
-        const res = await fetch(`${API_BASE_URL}/sales/category-prices?company=${selectedCompany}&categoryName=${encodeURIComponent(customer.category)}`);
+        const res = await fetch(`${API_BASE_URL}/sales/category-prices?company=${selectedCompany}&categoryName=${encodeURIComponent(customer.category)}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } });
         if (res.ok) {
           const data = await res.json();
           const priceMap: Record<number, number> = {};
@@ -178,6 +196,7 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
 
 
   const handleLoadSlip = async (slip: any) => {
+    osNumberRequestRef.current += 1;
     setLoadedOsId(slip.id); setOsNumber(slip.osNumber); setReferenceOs(slip.referenceOs || null); setIsVatApplied(slip.vatApplied || false); setLoadedOsStatus(slip.status || 'Generated');
     
     if (slip.customer) { 
@@ -195,7 +214,7 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
     
     if (mappedItems.length > 0) {
       const productIds = mappedItems.map(i => i.productId);
-      fetch(`${API_BASE_URL}/sales/order-slips/refresh-stock`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, productIds }) })
+      fetch(`${API_BASE_URL}/sales/order-slips/refresh-stock`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...getApiAuthHeaders(), 'x-company': selectedCompany }, body: JSON.stringify({ company: selectedCompany, productIds }) })
         .then(res => res.json()).then(stockMap => {
           setDraftItems(prev => prev.map(item => ({ ...item, officeStock: stockMap[item.productId]?.officeStock ?? 0, warehouseQty: stockMap[item.productId]?.warehouseQty ?? 0, warehouseBreakdown: stockMap[item.productId]?.warehouseBreakdown ?? [] })));
         }).catch(() => {});
@@ -210,6 +229,40 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
     else if (e.key === 'Enter') { e.preventDefault(); if (customerHighlightedIndex >= 0 && customerHighlightedIndex < filteredCustomers.length) handleCustomerSelect(filteredCustomers[customerHighlightedIndex]); } 
     else if (e.key === 'Escape') { setShowCustomerDropdown(false); setCustomerHighlightedIndex(-1); }
   };
+
+  // --- REFS FOR INVISIBLE SCANNER ---
+  const allProductsRef = useRef(allProducts);
+  allProductsRef.current = allProducts;
+  const draftItemsRef = useRef(draftItems);
+  draftItemsRef.current = draftItems;
+  const activeCategoryPricesRef = useRef(activeCategoryPrices);
+  activeCategoryPricesRef.current = activeCategoryPrices;
+
+  useInvisibleScanner((scannedSku) => {
+    const foundProduct = allProductsRef.current.find(p => p.sku.toUpperCase() === scannedSku.toUpperCase());
+    if (!foundProduct) return false;
+    if (document.activeElement instanceof HTMLInputElement) document.activeElement.blur();
+    const existingIndex = draftItemsRef.current.findIndex(i => i.productId === foundProduct.id);
+    if (existingIndex >= 0) {
+      setDraftItems(prev => prev.map((item, idx) => {
+        if (idx !== existingIndex) return item;
+        const newQty = (Number(item.requestedQty) || 0) + 1;
+        return { ...item, requestedQty: newQty, lineTotal: newQty * Number(item.unitPrice) };
+      }));
+      showToast(`+1 ${foundProduct.sku} added`, 'success');
+    } else {
+      const priceToUse = activeCategoryPricesRef.current[foundProduct.id] !== undefined
+        ? activeCategoryPricesRef.current[foundProduct.id]
+        : (foundProduct.sellingPrice || 0);
+      setDraftItems(prev => [...prev, {
+        productId: foundProduct.id, sku: foundProduct.sku, productName: foundProduct.name,
+        officeStock: foundProduct.currentStock || 0, warehouseQty: 0, warehouseBreakdown: [], selectedWarehouseName: null,
+        requestedQty: 1, unitPrice: priceToUse, lineTotal: priceToUse
+      }]);
+      showToast(`Added ${foundProduct.sku}`, 'success');
+    }
+    return true;
+  });
 
   const handleAddProduct = (p: SearchedProduct) => {
     if (draftItems.some(i => i.productId === p.id)) return showToast("Product already exists in the order.", "error");
@@ -279,16 +332,17 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
     setIsRefreshingStock(true);
     try {
       const productIds = draftItems.map(i => i.productId);
-      const res = await fetch(`${API_BASE_URL}/sales/order-slips/refresh-stock`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, productIds }) });
+      const res = await fetch(`${API_BASE_URL}/sales/order-slips/refresh-stock`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...getApiAuthHeaders(), 'x-company': selectedCompany }, body: JSON.stringify({ company: selectedCompany, productIds }) });
       if (!res.ok) throw new Error();
       const stockMap = await res.json();
       setDraftItems(prev => prev.map(item => ({ ...item, officeStock: stockMap[item.productId]?.officeStock ?? item.officeStock, warehouseQty: stockMap[item.productId]?.warehouseQty ?? item.warehouseQty, warehouseBreakdown: stockMap[item.productId]?.warehouseBreakdown ?? item.warehouseBreakdown })));
     } catch (e) { console.warn("Failed to refresh stock.", e); } finally { setIsRefreshingStock(false); }
   };
 
-  const subtotal = Math.round(draftItems.reduce((acc, item) => acc + (item.lineTotal || 0), 0) * 100) / 100;
-  const vatAmount = isVatApplied ? Math.round((subtotal * vatRate) * 100) / 100 : 0;
-  const grandTotal = Math.round((subtotal + vatAmount) * 100) / 100;
+  const decimalTotals = salesTotals(draftItems.map(item => roundSalesLine(item.requestedQty, item.unitPrice)), isVatApplied, vatRate);
+  const subtotal = docType === 'OS' ? decimalTotals.subtotal : Math.round(draftItems.reduce((acc, item) => acc + (item.lineTotal || 0), 0) * 100) / 100;
+  const vatAmount = docType === 'OS' ? decimalTotals.vatAmount : isVatApplied ? Math.round((subtotal * vatRate) * 100) / 100 : 0;
+  const grandTotal = docType === 'OS' ? decimalTotals.grandTotal : Math.round((subtotal + vatAmount) * 100) / 100;
   
   const isFormValid = selectedCustomer && osNumber.trim() !== '' && draftItems.length > 0 && draftItems.every(i => {
     const q = Number(i.requestedQty);
@@ -305,7 +359,7 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
     if (!isFO) {
       confirmMsg = `Notice: Marking an OS as ${newStatus} is safe. However, if a Final Order was generated from this OS, the backend will strictly block this action until the Final Order is cancelled first. Proceed?`;
     } else {
-      confirmMsg = `Marking this Final Order as ${newStatus} will safely restore deducted stock to the Office. Proceed?`;
+      confirmMsg = `Marking this Final Order as ${newStatus} will cancel an undispatched delivery; historical deducted stock is restored when applicable. Proceed?`;
     }
 
     if (!window.confirm(confirmMsg)) return;
@@ -313,7 +367,7 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
     setIsProcessing(true);
     try {
       const res = await fetch(`${API_BASE_URL}/sales/order-slips/${loadedOsId}`, { 
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: newStatus, user: loginUsername }) 
+        method: 'PATCH', headers: { 'Content-Type': 'application/json', ...getApiAuthHeaders(), 'x-company': selectedCompany }, body: JSON.stringify({ status: newStatus, user: loginUsername })
       });
       if (!res.ok) {
         const errorData = await res.json();
@@ -326,23 +380,59 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
     } catch (e: any) { showToast(e.message || "Failed to process cancellation.", "error"); } finally { setIsProcessing(false); }
   };
 
-  const handleSubmit = async () => {
+  const handleApproveAndReserve = async () => {
+    if (!finalizedOs || !canApprove) return;
+    setIsProcessing(true);
+    try {
+      const headers = { 'Content-Type': 'application/json', ...getApiAuthHeaders(), 'x-company': selectedCompany };
+      const response = await fetch(`${API_BASE_URL}/fulfillment/order-slips/${finalizedOs.id}/approve`, { method: 'POST', headers, body: '{}' });
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.message || 'Could not approve and reserve this order.');
+      }
+      const refreshed = await fetch(`${API_BASE_URL}/sales/order-slips/${finalizedOs.id}`, { headers });
+      if (!refreshed.ok) throw new Error('Order approved. Refresh the ledger to see its current status.');
+      const approved = await refreshed.json();
+      setFinalizedOs(approved);
+      setLoadedOsStatus(approved.status);
+      await handleRefreshStock();
+      showToast('Order approved. Available stock is reserved; review remaining demand in fulfillment.', 'success');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not reserve this order.', 'error');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+const handleSubmit = async () => {
     if (!isFormValid) return showToast("Complete all required fields and item quantities.", "error");
     setIsProcessing(true);
     try {
+      const endpoint = docType === 'QT' ? `${API_BASE_URL}/sales/quotations` : `${API_BASE_URL}/sales/order-slips`;
+      
       const payload = {
-        osNumber: osNumber.trim(), company: selectedCompany, customerId: selectedCustomer?.id, isVatApplied, vatRate, 
+        // Use qtNumber if QT, otherwise osNumber
+        [docType === 'QT' ? 'qtNumber' : 'osNumber']: osNumber.trim(), 
+        ...(docType === 'OS' ? { documentType: 'OS' } : {}),
+        company: selectedCompany, customerId: selectedCustomer?.id, isVatApplied, vatRate, 
         subtotal, vatAmount, grandTotal, user: loginUsername, referenceOs: referenceOs || null,
         items: draftItems.map(i => ({ productId: i.productId, sku: i.sku, productName: i.productName, requestedQty: Number(i.requestedQty), unitPrice: Number(i.unitPrice), lineTotal: Number(i.lineTotal) }))
       };
       
-      const res = await fetch(`${API_BASE_URL}/sales/order-slips`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      if (!res.ok) throw new Error("Failed to create Order Slip.");
+      const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', ...getApiAuthHeaders(), 'x-company': selectedCompany }, body: JSON.stringify(payload) });
+      if (!res.ok) {
+        const error = await res.json().catch(() => ({}));
+        throw new Error(error.message || `Failed to create ${docType}.`);
+      }
       
-      const newlyCreatedOs = await res.json();
-      showToast("Order Slip generated successfully.", "success");
-      setFinalizedOs(newlyCreatedOs); setFinalOrderGenerated(false); setLoadedOsId(null); setLoadedOsStatus('Generated');
-      fetchNextOsNumber(); fetchNextFoNumber();
+      const newlyCreatedDoc = await res.json();
+      
+      // Normalize the response so the UI components can read it consistently
+      if (docType === 'QT') newlyCreatedDoc.osNumber = newlyCreatedDoc.qtNumber; 
+      
+      showToast(`${newlyCreatedDoc.osNumber} generated successfully.`, "success");
+      setFinalizedOs(newlyCreatedDoc); setFinalOrderGenerated(false); setLoadedOsId(null); setLoadedOsStatus('Generated');
+      fetchNextOsNumber(); fetchNextFoNumber(); fetchSlipHistory();
     } catch (e: any) { showToast(e.message || "Network error. Please try again.", "error"); } finally { setIsProcessing(false); }
   };
 
@@ -358,25 +448,31 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
         }))
       };
       
-      const res = await fetch(`${API_BASE_URL}/sales/order-slips/${loadedOsId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      if (!res.ok) throw new Error("Failed to update Order Slip.");
+      const res = await fetch(`${API_BASE_URL}/sales/order-slips/${loadedOsId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', ...getApiAuthHeaders(), 'x-company': selectedCompany }, body: JSON.stringify(payload) });
+      if (!res.ok) {
+        const error = await res.json();
+        throw new Error(error.message || 'Failed to update Order Slip.');
+      }
       
       const updatedOs = await res.json();
       await handleRefreshStock(); 
       showToast("Order updated successfully.", "success");
       setFinalizedOs(updatedOs); setFinalOrderGenerated(updatedOs.osNumber.startsWith('FO'));
-      fetchNextOsNumber(); fetchNextFoNumber();
+      fetchNextFoNumber(); fetchSlipHistory();
     } catch (e: any) { showToast(e.message || "Network error. Please try again.", "error"); } finally { setIsProcessing(false); }
   };
 
   const handleGenerateFinalOrder = async () => {
     if (!finalizedOs) return;
-    if (!finalOrderNumber.trim()) return showToast("Please enter a valid Final Order Number", "error");
+    const requestedNumber = finalOrderNumber.trim();
+    const foNumber = /^\d+$/.test(requestedNumber) ? `FO-${requestedNumber.padStart(6, '0')}` : requestedNumber;
+    if (!foNumber.startsWith('FO')) return showToast('Enter a Final Order number starting with FO, or enter digits only.', 'error');
 
     setIsGeneratingFinalOrder(true);
     try {
       const payload = {
-        osNumber: finalOrderNumber.trim(), 
+        osNumber: foNumber,
+        documentType: 'FO',
         referenceOs: finalizedOs.osNumber, 
         company: selectedCompany, 
         customerId: selectedCustomer?.id || finalizedOs.customerId,
@@ -396,7 +492,7 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
         }))
       };
 
-      const res = await fetch(`${API_BASE_URL}/sales/order-slips`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      const res = await fetch(`${API_BASE_URL}/sales/order-slips`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...getApiAuthHeaders(), 'x-company': selectedCompany }, body: JSON.stringify(payload) });
       
       if (!res.ok) {
         let errDesc = "Failed to create Final Order in Database.";
@@ -408,22 +504,23 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
 
       try {
         await fetch(`${API_BASE_URL}/sales/order-slips/${finalizedOs.id}`, { 
-          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'Finalized Order', user: loginUsername }) 
+          method: 'PATCH', headers: { 'Content-Type': 'application/json', ...getApiAuthHeaders(), 'x-company': selectedCompany }, body: JSON.stringify({ status: 'Finalized Order', user: loginUsername })
         });
       } catch (patchErr) {
         console.warn("Could not patch original OS status, but FO was generated.");
       }
 
       await handleRefreshStock(); 
-      showToast("Final Order logged & Stock Deducted instantly!", "success");
+      showToast(`${newFo.osNumber} queued for picking and dispatch.`, "success");
       
       const completeFo = { ...newFo, customer: selectedCustomer || finalizedOs.customer };
       
       setFinalizedOs(completeFo); 
       setFinalOrderGenerated(true); 
+      osNumberRequestRef.current += 1;
       setOsNumber(completeFo.osNumber); 
       setLoadedOsId(completeFo.id);
-      fetchNextFoNumber();
+      fetchNextFoNumber(); fetchSlipHistory();
     } catch (e: any) { 
       showToast(e.message || "Failed to generate Final Order.", "error"); 
     } finally { 
@@ -439,14 +536,14 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
   const handlePrint = () => window.print();
 
   return (
-    <div className="flex flex-col h-screen w-full bg-[#F8FAFC] font-sans text-slate-900 overflow-hidden print:h-auto print:overflow-visible">
+    <div className="order-entry-workspace order-os-workspace flex flex-col h-screen w-full bg-[#F8FAFC] font-sans text-slate-900 overflow-hidden print:h-auto print:overflow-visible">
       {toast && (
-        <div className={`fixed bottom-6 right-6 z-[100] px-5 py-3.5 rounded-xl shadow-xl font-bold text-sm ${toast.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'} print:hidden`}>
+        <div className={`fixed bottom-6 right-6 z-[300] px-5 py-3.5 rounded-xl shadow-xl font-bold text-sm ${toast.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'} print:hidden`}>
           {toast.message}
         </div>
       )}
 
-      <header className="h-16 sm:h-20 bg-white border-b border-slate-200 flex items-center justify-between px-6 sm:px-8 shrink-0 shadow-sm z-20 print:hidden">
+      <header className="order-entry-header h-16 sm:h-20 bg-white border-b border-slate-200 flex items-center justify-between px-6 sm:px-8 shrink-0 shadow-sm z-20 print:hidden">
         <div><h2 className="text-xl sm:text-2xl font-black text-slate-800 tracking-tight">{selectedCompany} <span className="text-slate-400 font-medium">| Create Order Slip</span></h2></div>
         <div className="flex gap-3">
           <button onClick={() => { if (onViewLedger) onViewLedger(); else if (setActiveTab) setActiveTab('os-ledger'); }} className="px-4 sm:px-5 py-2 sm:py-2.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-xl text-[10px] sm:text-xs font-bold uppercase tracking-wider transition-colors shadow-sm cursor-pointer z-50 relative">
@@ -458,14 +555,31 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
         </div>
       </header>
 
-      <main className="flex-1 flex flex-col p-4 sm:p-6 lg:p-8 overflow-hidden print:hidden">
-        <div className="flex-1 flex flex-col w-full mx-auto bg-white border border-slate-300 rounded-xl shadow-lg overflow-hidden">
+      <main className="order-os-main flex-1 flex flex-col p-4 sm:p-6 lg:p-8 overflow-hidden print:hidden">
+        <div className="order-os-editor flex-1 flex flex-col w-full mx-auto bg-white border border-slate-300 rounded-xl shadow-lg overflow-hidden">
           
-          <div className="border-b border-slate-300 bg-white relative shrink-0 z-30 flex items-stretch min-h-[56px]">
-            <div className="w-48 sm:w-64 border-r border-slate-300 relative flex flex-col justify-center px-4 sm:px-6 bg-slate-50">
+          <div className="order-os-metadata border-b border-slate-300 bg-white relative shrink-0 z-30 flex items-stretch min-h-[56px]">
+            {/* NEW: DOCUMENT TYPE TOGGLE */}
+          <div className="order-document-toggle flex bg-slate-100 p-1 mx-4 sm:mx-6 mt-4 rounded-xl shadow-inner w-full sm:w-80" role="group" aria-label="Document type">
+            <button 
+              aria-pressed={docType === 'OS'}
+              onClick={() => setDocType('OS')} 
+              className={`flex-1 px-6 py-2 rounded-lg text-xs font-black uppercase tracking-widest transition-all ${docType === 'OS' ? 'bg-white text-indigo-700 shadow border border-slate-200' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              Order Slip
+            </button>
+            <button 
+              aria-pressed={docType === 'QT'}
+              onClick={() => setDocType('QT')} 
+              className={`flex-1 px-6 py-2 rounded-lg text-xs font-black uppercase tracking-widest transition-all ${docType === 'QT' ? 'bg-white text-amber-700 shadow border border-slate-200' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              Quotation
+            </button>
+          </div>
+            <div className="order-entry-field order-template-field w-48 sm:w-64 border-r border-slate-300 relative flex flex-col justify-center px-4 sm:px-6 bg-slate-50">
               <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">Load Template</span>
               <input 
-                type="text" placeholder="Search OS/FO..." value={loadSlipSearch}
+                type="text" aria-label="Load template" placeholder="Search OS/FO..." value={loadSlipSearch}
                 onChange={e => { setLoadSlipSearch(e.target.value); setShowLoadSlipDropdown(true); }}
                 onFocus={() => setShowLoadSlipDropdown(true)}
                 onBlur={() => setTimeout(() => setShowLoadSlipDropdown(false), 200)}
@@ -491,11 +605,12 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
               )}
             </div>
 
-            <div className="flex-1 relative flex items-center border-r border-slate-300">
+            <div className="order-entry-field order-customer-field flex-1 relative flex items-center border-r border-slate-300">
+              <span className="order-entry-label">Customer</span>
               {!selectedCustomer ? (
                 <div className="w-full relative">
                   <input 
-                    type="text" placeholder="Search customer..." value={customerSearch}
+                    type="text" aria-label="Search customer" placeholder="Search customer..." value={customerSearch}
                     onChange={e => { setCustomerSearch(e.target.value); setShowCustomerDropdown(true); setCustomerHighlightedIndex(-1); }}
                     onFocus={() => setShowCustomerDropdown(true)}
                     onBlur={() => setTimeout(() => setShowCustomerDropdown(false), 200)}
@@ -532,18 +647,20 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
               )}
             </div>
 
-            <div className="w-48 sm:w-64 bg-slate-50 flex flex-col justify-center px-4 sm:px-6 shrink-0 shadow-inner">
-              <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">{osNumber.startsWith('FO') ? 'F.O. Number' : 'O.S. Number'}</span>
+            <div className="order-entry-field order-document-number w-48 sm:w-64 bg-slate-50 flex flex-col justify-center px-4 sm:px-6 shrink-0 shadow-inner">
+              <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">{osNumber.startsWith('FO') ? 'F.O. Number' : docType === 'QT' ? 'Quotation Number' : 'O.S. Number'}</span>
               <input 
                 type="text" value={osNumber} readOnly={loadedOsId !== null} 
-                onChange={e => setOsNumber(e.target.value.toUpperCase())}
+                aria-label={docType === 'QT' ? 'Quotation number' : 'Order Slip number'}
+                onChange={e => { osNumberRequestRef.current += 1; setOsNumber(e.target.value.toUpperCase()); }}
                 className={`w-full bg-transparent font-mono font-black text-sm sm:text-base outline-none transition-colors uppercase ${osNumber.startsWith('FO') ? 'text-teal-600 focus:text-teal-500' : 'text-indigo-700 focus:text-indigo-500'} ${loadedOsId !== null ? 'opacity-70 cursor-not-allowed' : ''}`}
-                placeholder="OS-000000"
+                placeholder={`${docType}-000000`}
               />
+              {!loadedOsId && <span className="text-[10px] text-slate-500 mt-1">Suggested; advances if already taken.</span>}
             </div>
           </div>
 
-          <div className="flex-1 overflow-auto bg-slate-50/30 relative flex flex-col">
+          <div className="order-os-lines flex-1 overflow-auto bg-slate-50/30 relative flex flex-col" role="region" aria-label="Order items" tabIndex={0}>
             <table className="w-full text-left border-collapse whitespace-nowrap text-sm min-w-[900px] flex-1">
               <thead className="sticky top-0 bg-slate-50 shadow-sm z-20">
                 <tr>
@@ -580,7 +697,7 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
                         <input type="text" inputMode="decimal" value={item.unitPrice} onChange={e => handleUpdateUnitPrice(idx, e.target.value)} className="w-full h-[48px] pl-6 pr-4 py-3 text-right font-medium text-slate-700 font-mono bg-transparent outline-none focus:bg-indigo-50 focus:ring-2 focus:ring-indigo-500 transition-all" />
                       </td>
 
-                      <td className="border border-slate-300 py-2.5 px-4 text-right font-black text-slate-900 font-mono">₱{(item.lineTotal || 0).toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>
+                      <td className="border border-slate-300 py-2.5 px-4 text-right font-black text-slate-900 font-mono">₱{(docType === 'OS' ? roundSalesLine(item.requestedQty, item.unitPrice) : item.lineTotal || 0).toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>
 
                       <td className={`border border-slate-300 py-1.5 px-2 text-center relative group`}>
                         <div className="inline-flex flex-col items-center justify-center cursor-pointer hover:bg-slate-100 p-1 rounded transition-colors w-full">
@@ -606,8 +723,10 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
                   );
                 })}
 
-                <tr className="bg-white group">
-                  <td className="border border-slate-300 bg-slate-50/50 h-[48px]"></td>
+               <tr className="bg-white group">
+                  
+              <td className="border border-slate-300 bg-slate-50/50 h-[48px]"></td>
+
                   <td className="border border-slate-300 relative p-0 h-[48px] w-full">
                     <div className="absolute inset-0 flex items-center">
                       <input 
@@ -647,7 +766,7 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
             </table>
           </div>
 
-          <div className="bg-[#E2E8F0] border-t border-slate-300 p-4 sm:p-5 flex flex-col sm:flex-row justify-between items-center shrink-0 z-30">
+          <div className="order-os-footer bg-[#E2E8F0] border-t border-slate-300 p-4 sm:p-5 flex flex-col sm:flex-row justify-between items-center shrink-0 z-30">
             <div className="flex items-center gap-6 w-full sm:w-auto">
               <label className="flex items-center gap-2 cursor-pointer group">
                 <input type="checkbox" checked={isVatApplied} onChange={e => setIsVatApplied(e.target.checked)} className="w-4 h-4 rounded text-indigo-600 border-slate-400 focus:ring-indigo-500 cursor-pointer" />
@@ -670,13 +789,13 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
                 </>
               )}
 
-              {loadedOsId ? (
+        {loadedOsId ? (
                 <button onClick={handleUpdateOrder} disabled={!isFormValid || isProcessing || loadedOsStatus === 'Cancelled' || loadedOsStatus === 'Returned'} className="px-8 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-400 text-white font-black text-xs uppercase tracking-widest rounded-lg transition-colors shadow-sm">
-                  {isProcessing ? 'Updating...' : (osNumber.startsWith('FO') ? 'Update F.O.' : 'Update O.S.')}
+                  {isProcessing ? 'Updating...' : (osNumber.startsWith('FO') ? 'Update F.O.' : `Update ${docType}`)}
                 </button>
               ) : (
-                <button onClick={handleSubmit} disabled={!isFormValid || isProcessing} className="px-8 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-400 text-white font-black text-xs uppercase tracking-widest rounded-lg transition-colors shadow-sm">
-                  {isProcessing ? 'Saving...' : 'Finalize O.S.'}
+                <button onClick={handleSubmit} disabled={!isFormValid || isProcessing} className={`px-8 py-3 disabled:bg-slate-400 text-white font-black text-xs uppercase tracking-widest rounded-lg transition-colors shadow-sm ${docType === 'QT' ? 'bg-amber-500 hover:bg-amber-600' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
+                  {isProcessing ? 'Saving...' : `Finalize ${docType === 'QT' ? 'Quotation' : 'O.S.'}`}
                 </button>
               )}
             </div>
@@ -691,25 +810,126 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
           
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl my-auto print:shadow-none print:m-0 print:rounded-none flex flex-col max-h-full print:max-h-none print:block print:h-auto print:overflow-visible">
             
-            <div className="p-6 border-b border-emerald-100 flex justify-between items-center bg-emerald-50 shrink-0 print:hidden rounded-t-2xl">
+            <div className="p-6 border-b border-emerald-100 flex flex-wrap gap-3 justify-between items-center bg-emerald-50 shrink-0 print:hidden rounded-t-2xl">
               <div>
-                <h3 className="text-xl font-black text-emerald-900 tracking-tight">
-                  {loadedOsId ? (finalizedOs.osNumber.startsWith('FO') ? 'F.O. Updated Successfully!' : 'O.S. Updated Successfully!') : 'O.S. Generated Successfully!'}
-                </h3>
-                <p className="text-xs font-mono uppercase text-emerald-600 tracking-widest mt-1">Ready for immediate printing.</p>
+             <h3 className="text-xl font-black text-emerald-900 tracking-tight">
+    {loadedOsId ? `${finalizedOs.osNumber.substring(0,2)} Updated Successfully!` : `${finalizedOs.osNumber.substring(0,2)} Generated Successfully!`}
+  </h3>
+                <p className="text-xs font-mono uppercase text-emerald-600 tracking-widest mt-1">Status: {finalizedOs.status}. Ready to print.</p>
               </div>
-              <div className="flex gap-3">
-                {!finalOrderGenerated && finalizedOs.osNumber.startsWith('OS') ? (
+              <div className="flex flex-wrap gap-3">
+               {canApprove && finalizedOs.osNumber.startsWith('OS') && !['Cancelled', 'Returned', 'Finalized Order'].includes(finalizedOs.status) && (
+                 <button onClick={handleApproveAndReserve} disabled={isProcessing || isGeneratingFinalOrder} className="px-4 py-2 rounded-lg bg-indigo-600 text-white text-xs font-bold disabled:opacity-50">{isProcessing ? 'Reserving...' : 'Approve & reserve'}</button>
+               )}
+               {onOpenFulfillment && <button onClick={onOpenFulfillment} className="px-4 py-2 rounded-lg border border-teal-300 text-teal-800 text-xs font-bold">Fulfillment & delivery</button>}
+               {!finalOrderGenerated && finalizedOs.osNumber.startsWith('OS') ? (
                   <div className="flex items-center gap-2 bg-teal-50 p-2 rounded-xl border-2 border-teal-200 shadow-sm mr-2">
-                    <input type="text" value={finalOrderNumber} onChange={(e) => setFinalOrderNumber(e.target.value.toUpperCase())} className="w-36 px-3 py-2 text-sm font-mono font-black text-slate-900 bg-white border-2 border-teal-400 rounded-lg outline-none focus:border-teal-600 uppercase placeholder:text-slate-400 placeholder:font-medium" placeholder="FO-000000" />
+                    <div>
+                      <input type="text" aria-label="Final Order number" value={finalOrderNumber} onChange={(e) => { foNumberRequestRef.current += 1; setFinalOrderNumber(e.target.value.toUpperCase()); }} className="w-36 px-3 py-2 text-sm font-mono font-black text-slate-900 bg-white border-2 border-teal-400 rounded-lg outline-none focus:border-teal-600 uppercase placeholder:text-slate-400 placeholder:font-medium" placeholder="FO-000000" />
+                      <p className="text-[10px] text-teal-800 mt-1">Suggested; advances if taken.</p>
+                    </div>
+                    
                     <button onClick={handleGenerateFinalOrder} disabled={isGeneratingFinalOrder || !finalOrderNumber} className="px-5 py-2.5 bg-teal-600 text-white text-[11px] font-black uppercase tracking-widest rounded-lg hover:bg-teal-700 disabled:bg-slate-400 shadow-sm transition-colors">
                       {isGeneratingFinalOrder ? 'Gen...' : 'Gen Final Order'}
                     </button>
+
+                    {/* NEW PL BUTTON FOR THE SUCCESS MODAL */}
+                  <button 
+                      onClick={async () => {
+                        setIsGeneratingFinalOrder(true);
+                        try {
+ const payload = {
+                            referenceOs: finalizedOs.osNumber, 
+                            company: selectedCompany, 
+                            customerId: finalizedOs.customerId,
+                            isVatApplied: finalizedOs.isVatApplied ?? finalizedOs.vatApplied, 
+                            vatRate: Number(finalizedOs.vatRate), 
+                            subtotal: Number(finalizedOs.subtotal), 
+                            vatAmount: Number(finalizedOs.vatAmount), 
+                            grandTotal: Number(finalizedOs.grandTotal), 
+                            user: loginUsername,
+                            items: finalizedOs.items.map((i: any) => ({
+                              productId: i.productId,
+                              sku: i.sku,
+                              productName: i.productName,
+                              requestedQty: Number(i.requestedQty),
+                              unitPrice: Number(i.unitPrice),
+                              lineTotal: Number(i.lineTotal)
+                            }))
+                          };
+
+                          const res = await fetch(`${API_BASE_URL}/sales/packing-lists`, { 
+                            method: 'POST', headers: { 'Content-Type': 'application/json', ...getApiAuthHeaders(), 'x-company': selectedCompany }, body: JSON.stringify(payload)
+                          });
+                          
+                          if (!res.ok) {
+                            const error = await res.json();
+                            throw new Error(error.message || 'Failed to create Packing List in Database.');
+                          }
+                          const newPl = await res.json();
+                          newPl.osNumber = newPl.plNumber; // Normalize for the UI
+
+                          await handleRefreshStock(); 
+                          showToast(`${newPl.plNumber} queued for picking and dispatch.`, "success");
+                          setFinalizedOs({ ...newPl, customer: selectedCustomer || finalizedOs.customer }); 
+                          setFinalOrderGenerated(true); 
+                        } catch (e: any) { 
+                          showToast(e.message || "Failed to generate PL.", "error"); 
+                        } finally { 
+                          setIsGeneratingFinalOrder(false); 
+                        }
+                      }} 
+                      disabled={isGeneratingFinalOrder}
+                      className="px-5 py-2.5 bg-amber-500 text-white text-[11px] font-black uppercase tracking-widest rounded-lg hover:bg-amber-600 shadow-sm transition-colors ml-2"
+                    >
+                      Gen Packing List
+                    </button>
+
                   </div>
                 ) : finalOrderGenerated ? (
                   <span className="px-5 py-2.5 bg-teal-200 text-teal-800 text-[10px] font-black uppercase tracking-widest rounded-xl shadow-sm border border-teal-300 flex items-center">✓ FINAL ORDER LOGGED</span>
                 ) : null}
-                <button onClick={handlePrint} className="px-5 py-2.5 bg-indigo-600 text-white text-[10px] font-black uppercase tracking-widest rounded-xl hover:bg-indigo-700 shadow-sm transition-colors">Print {finalizedOs.osNumber.startsWith('FO') ? 'F.O.' : 'O.S.'}</button>
+                <button onClick={handlePrint} className="px-5 py-2.5 bg-indigo-600 text-white text-[10px] font-black uppercase tracking-widest rounded-xl hover:bg-indigo-700 shadow-sm transition-colors">
+    Print {finalizedOs.osNumber.startsWith('QT') ? 'Quotation' : finalizedOs.osNumber.startsWith('PL') ? 'Packing List' : finalizedOs.osNumber.startsWith('FO') ? 'Final Order' : 'Order Slip'}
+  </button>
+                {finalizedOs.osNumber.startsWith('QT') && (
+  <>
+{(finalizedOs.osNumber.startsWith('QT') || finalizedOs.osNumber.startsWith('PL')) && (
+  <>
+    <button 
+      onClick={() => {
+        let msg = `${finalizedOs.osNumber.startsWith('QT') ? 'Quotation' : 'Packing List'} ${finalizedOs.osNumber} for ${finalizedOs.customer?.name}%0A%0A`;
+        msg += `ITEMS:%0A`;
+        finalizedOs.items.forEach((item: any) => {
+          msg += `- ${item.requestedQty}x ${item.productName} @ ₱${Number(item.unitPrice).toFixed(2)} = ₱${Number(item.lineTotal).toFixed(2)}%0A`;
+        });
+        msg += `%0A-------------------%0ATOTAL: ₱${Number(finalizedOs.grandTotal).toLocaleString('en-PH', {minimumFractionDigits:2})}`;
+        window.open(`viber://forward?text=${msg}`);
+      }}
+      className="px-5 py-2.5 bg-[#7360f2] text-white text-[10px] font-black uppercase tracking-widest rounded-xl hover:bg-[#5e4bcf] shadow-sm transition-colors"
+    >
+      Send via Viber
+    </button>
+    
+    <button 
+      onClick={() => {
+        const subject = `${finalizedOs.osNumber.startsWith('QT') ? 'Quotation' : 'Packing List'} ${finalizedOs.osNumber} - ${selectedCompany}`;
+        let body = `Hello ${finalizedOs.customer?.name},\n\nHere are the details for your ${finalizedOs.osNumber.startsWith('QT') ? 'Quotation' : 'Packing List'}:\n\n`;
+        finalizedOs.items.forEach((item: any) => {
+          body += `${item.requestedQty}x ${item.productName} (₱${Number(item.unitPrice).toFixed(2)}) = ₱${Number(item.lineTotal).toFixed(2)}\n`;
+        });
+        body += `\nGRAND TOTAL: ₱${Number(finalizedOs.grandTotal).toLocaleString('en-PH', {minimumFractionDigits:2})}\n\nThank you for your business!`;
+        
+        window.open(`mailto:${finalizedOs.customer?.email || ''}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`);
+      }}
+      className="px-5 py-2.5 bg-blue-500 text-white text-[10px] font-black uppercase tracking-widest rounded-xl hover:bg-blue-600 shadow-sm transition-colors"
+    >
+      Send via Email
+    </button>
+  </>
+)}
+  </>
+)}
                 <button onClick={handleClosePrintModal} className="px-4 py-2.5 bg-white border border-slate-300 text-slate-700 text-[10px] font-black uppercase tracking-widest rounded-xl hover:bg-slate-50 shadow-sm transition-colors">Close & Start New</button>
               </div>
             </div>
@@ -729,9 +949,9 @@ export default function CreateOSModule({ selectedCompany, loginUsername, API_BAS
                   <h1 className="text-3xl print:text-2xl font-black text-slate-900 uppercase tracking-widest leading-none">
                     {selectedCompany}
                   </h1>
-                  <h2 className="text-lg font-black text-slate-900 uppercase tracking-widest leading-none">
-                    {finalizedOs.osNumber.startsWith('FO') ? 'Final Order' : 'Order Slip'}
-                  </h2>
+            <h2 className="text-lg font-black text-slate-900 uppercase tracking-widest leading-none">
+    {finalizedOs.osNumber.startsWith('QT') ? 'Quotation' : finalizedOs.osNumber.startsWith('PL') ? 'Packing List' : finalizedOs.osNumber.startsWith('FO') ? 'Final Order' : 'Order Slip'}
+  </h2>
                 </div>
                 
                 {/* Billed To (Left) & OS Number (Right) */}

@@ -34,7 +34,7 @@ export class AuthSessionService implements OnModuleDestroy {
     const issuedAt = Math.floor(Date.now() / 1000);
     const expiresAt = issuedAt + SESSION_SECONDS;
     const payload = Buffer.from(JSON.stringify({
-      iss: 'olten', sub: admin.id, iat: issuedAt, exp: expiresAt,
+      iss: 'wilcare', sub: admin.id, iat: issuedAt, exp: expiresAt,
       version: this.passwordVersion(admin.password),
     })).toString('base64url');
     const unsignedToken = `${TOKEN_HEADER}.${payload}`;
@@ -57,7 +57,7 @@ export class AuthSessionService implements OnModuleDestroy {
       claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     } catch { throw unauthorized(); }
     const now = Math.floor(Date.now() / 1000);
-    if (!claims || claims.iss !== 'olten' || !Number.isSafeInteger(claims.sub) || Number(claims.sub) < 1
+    if (!claims || claims.iss !== 'wilcare' || !Number.isSafeInteger(claims.sub) || Number(claims.sub) < 1
       || !Number.isSafeInteger(claims.iat) || !Number.isSafeInteger(claims.exp)
       || Number(claims.exp) <= now || Number(claims.iat) > now + 30
       || Number(claims.exp) - Number(claims.iat) !== SESSION_SECONDS

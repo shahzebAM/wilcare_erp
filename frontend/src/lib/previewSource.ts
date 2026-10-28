@@ -66,7 +66,7 @@ export function clearDocumentPreviews() {
   readyEngine?.discardPreparedPdfWorker();
   for (const entry of sources.values()) dispose(entry);
 }
-if (typeof window !== 'undefined') window.addEventListener('olten-session-expired', clearDocumentPreviews);
+if (typeof window !== 'undefined') window.addEventListener('wilcare-session-expired', clearDocumentPreviews);
 
 export function invalidateDocumentPreviews(company: string, documentIds: Set<number>, driveIds: Set<string>) {
   if (intent?.options.company === company && (intent.options.source === 'document'

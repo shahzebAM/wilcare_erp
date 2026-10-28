@@ -1,7 +1,7 @@
 import type { CorsOptions } from '@nestjs/common/interfaces/external/cors-options.interface';
 
 export function createCorsOptions(environment: NodeJS.ProcessEnv = process.env): CorsOptions {
-  const origins = new Set<string>(['https://olten.vercel.app']);
+  const origins = new Set<string>(['https://wilcarephil.vercel.app']);
   if (environment.NODE_ENV !== 'production') {
     ['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:4173', 'http://127.0.0.1:4173'].forEach(origin => origins.add(origin));
   }

@@ -1,9 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { getApiAuthHeaders } from '../lib/apiSession';
+import { isBuiltInCompany, isLegacyCompany } from '../lib/companies';
 import { DndContext, closestCenter, MouseSensor, TouchSensor, useSensor, useSensors } from '@dnd-kit/core';
 import type { DragEndEvent } from '@dnd-kit/core';
 import { arrayMove, SortableContext, rectSortingStrategy, useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
+import { canEditWorkspaceMenu, getWorkspaceNavigationGroups, matchesWorkspaceModule, normalizeWorkspaceMenuGroups } from '../lib/workspaceNavigation';
+import type { WorkspaceMenuGroup } from '../lib/workspaceNavigation';
+import WorkspaceMenuEditor from '../components/WorkspaceMenuEditor';
 
 // --- DRAG AND DROP WRAPPER COMPONENT ---
 function SortableModuleCard({ id, children, disabled = false }: { id: string; children: React.ReactNode; disabled?: boolean }) {
@@ -35,13 +39,18 @@ function SortableModuleCard({ id, children, disabled = false }: { id: string; ch
 export default function CompanyModule({ 
   isGateway, allowedCompanies, hasUsers, onSelectCompany, onManageUsers, onLogout,
   selectedCompany, loginUsername, currentUser, adminUsers = [],
-  hasPayroll, hasAiDocs, hasProducts, hasInventory, hasWarehouses, hasPurchasing, hasSales,
-  onChangeCompany, onSelectModule, onAddCompany, onRemoveCompany, companiesList = [], API_BASE_URL
+  hasPayroll, hasAiDocs, hasProducts, hasInventory, hasWarehouses, hasPurchasing, hasSales, hasImportation,
+  hasFinance, hasBooks, hasService, hasExecutive, hasAiAssistant,
+  onChangeCompany, onSelectModule, onAddCompany, onRemoveCompany, companiesList = [], API_BASE_URL,
+  navigationOnly = false, activeModule = 'none', onWorkspace,
+  navigationGroups, navigationVersion, navigationLoading = false, navigationError = '', onSaveNavigation
 }: any) {
   
   const [showAddModal, setShowAddModal] = useState(false);
   const [newCompany, setNewCompany] = useState('');
   const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
+  const [moduleSearch, setModuleSearch] = useState('');
+  const [menuEditor, setMenuEditor] = useState<{ groups: WorkspaceMenuGroup[]; version?: number } | null>(null);
   const [deletingCompany, setDeletingCompany] = useState<string | null>(null);
   const deletingCompanyRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
@@ -58,6 +67,11 @@ export default function CompanyModule({
   
   // Check if current user is allowed to rearrange modules and view admin tools
   const isAdmin = currentUser?.role === 'Super Admin' || hasUsers;
+  const canEditMenu = canEditWorkspaceMenu(currentUser) && typeof onSaveNavigation === 'function';
+  const openMenuEditor = () => {
+    if (canEditMenu && !navigationLoading) setMenuEditor({ groups: normalizeWorkspaceMenuGroups(navigationGroups), version: navigationVersion });
+  };
+  const renderMenuEditor = () => menuEditor && canEditMenu ? <WorkspaceMenuEditor company={selectedCompany} groups={menuEditor.groups} version={menuEditor.version} onSave={onSaveNavigation} onClose={() => setMenuEditor(null)} /> : null;
 
   // The delay makes it so a quick click triggers the button, but holding for 250ms starts the drag.
   const sensors = useSensors(
@@ -94,15 +108,27 @@ export default function CompanyModule({
     return formattedUsers;
   }, [adminUsers, isAdmin, loginUsername, selectedCompany]);
 
-  useEffect(() => {
+useEffect(() => {
     if (!isGateway || isDraggingGrid) return; 
 
     const activeIds: string[] = [];
     if (hasSales) activeIds.push('customers', 'create_os', 'sales_orders');
-    if (hasPurchasing) activeIds.push('suppliers', 'purchase_orders'); 
-    if (hasProducts || hasInventory || hasWarehouses) activeIds.push('inventory');
+    if (hasSales || hasInventory || hasWarehouses) activeIds.push('deliveries');
+    if (hasPurchasing) activeIds.push('suppliers');
+    if (hasPurchasing || hasSales) activeIds.push('purchase_orders');
+    if (hasImportation) activeIds.push('importation');
+    
+    // ADD 'generate_qr' RIGHT HERE:
+    if (hasProducts || hasInventory || hasWarehouses) activeIds.push('inventory', 'generate_qr');
+    if (hasInventory || hasWarehouses) activeIds.push('warehouse_ops');
+    
     if (hasPayroll) activeIds.push('payroll');
     if (hasAiDocs) activeIds.push('ai_docs');
+    if (hasFinance) activeIds.push('finance');
+    if (hasBooks) activeIds.push('books');
+    if (hasService) activeIds.push('service');
+    if (hasExecutive) activeIds.push('executive');
+    if (hasAiAssistant) activeIds.push('ai_assistant');
 
     const dbOrder = currentUser?.moduleOrder;
     const savedOrder = (Array.isArray(dbOrder) && dbOrder.length > 0) 
@@ -118,7 +144,7 @@ export default function CompanyModule({
       if (JSON.stringify(prev) !== JSON.stringify(mergedOrder)) return mergedOrder;
       return prev;
     });
-  }, [isGateway, hasSales, hasPurchasing, hasProducts, hasInventory, hasWarehouses, hasPayroll, hasAiDocs, loginUsername, currentUser, isDraggingGrid]);
+  }, [isGateway, hasSales, hasPurchasing, hasImportation, hasProducts, hasInventory, hasWarehouses, hasPayroll, hasAiDocs, hasFinance, hasBooks, hasService, hasExecutive, hasAiAssistant, loginUsername, currentUser, isDraggingGrid]);
 
   const handleDragEnd = async (event: DragEndEvent) => {
     setIsDraggingGrid(false); 
@@ -160,7 +186,8 @@ export default function CompanyModule({
     e.preventDefault();
     const trimmed = newCompany.trim();
     if (trimmed) {
-      if (companiesList.includes(trimmed)) return showToast("A workspace with this name already exists.", "error");
+      if (isLegacyCompany(trimmed)) return showToast('This workspace name is unavailable.', 'error');
+      if (companiesList.some((company: string) => company.toLowerCase() === trimmed.toLowerCase())) return showToast("A workspace with this name already exists.", "error");
       onAddCompany(trimmed);
       showToast(`Workspace "${trimmed}" created successfully.`, "success");
       setNewCompany('');
@@ -170,6 +197,7 @@ export default function CompanyModule({
 
   const handleRemoveClick = async (e: React.MouseEvent, company: string) => {
     e.stopPropagation();
+    if (isBuiltInCompany(company)) return;
     if (deletingCompanyRef.current) return;
     const confirmName = window.prompt(`This will permanently delete the "${company}" workspace, its Google Drive folder and stored documents, and their reminders.\n\nPlease type "${company}" to confirm:`);
     if (confirmName === company) {
@@ -190,10 +218,7 @@ export default function CompanyModule({
   };
 
   const getCompanyTheme = (name: string) => {
-    const lower = name.toLowerCase();
-    if (lower === 'surgicom') return { title: 'text-blue-950', sub: 'Trading Corporation', iconBg: 'bg-blue-50', icon: 'text-blue-600', borderHover: 'hover:border-blue-400' };
-    if (lower === 'olten') return { title: 'text-indigo-950', sub: 'Instruments', iconBg: 'bg-indigo-50', icon: 'text-indigo-600', borderHover: 'hover:border-indigo-400' };
-    if (lower === 'ordent') return { title: 'text-amber-900', sub: 'Dental Clinic', iconBg: 'bg-amber-50', icon: 'text-amber-600', borderHover: 'hover:border-amber-400' };
+    if (isBuiltInCompany(name)) return { title: 'text-indigo-950', sub: 'Wilcare ERP', iconBg: 'bg-indigo-50', icon: 'text-indigo-600', borderHover: 'hover:border-indigo-400' };
     return { title: 'text-slate-900', sub: 'Workspace Environment', iconBg: 'bg-slate-100', icon: 'text-slate-600', borderHover: 'hover:border-slate-400' };
   };
 
@@ -256,6 +281,21 @@ export default function CompanyModule({
     );
 
     switch (id) {
+      case 'finance':
+      case 'books':
+      case 'service':
+      case 'executive':
+      case 'ai_assistant': {
+        const cards: Record<string, { title: string; description: string; icon: string }> = {
+          finance: { title: 'Landed Cost & Finance', description: 'Shipment costs, invoices, bills, payments and aging.', icon: '₱' },
+          books: { title: 'Books & Reconciliation', description: 'Accounts, balanced journals and bank reconciliation.', icon: '≋' },
+          service: { title: 'Medical Device Service', description: 'Serial warranties, preventive maintenance and repairs.', icon: '⚙' },
+          executive: { title: 'Executive Dashboard', description: 'Live alerts, demand forecasts and management reports.', icon: '▥' },
+          ai_assistant: { title: 'Executive AI & Invoice OCR', description: 'Role-aware questions and invoice reading for review.', icon: '✧' },
+        };
+        const card = cards[id];
+        return <button onClick={() => onSelectModule(id)} className="group flex h-full w-full items-center justify-between rounded-2xl border border-slate-200 bg-white p-5 text-left shadow-sm transition-all hover:border-teal-300 hover:shadow-md focus:outline-none focus:ring-4 focus:ring-teal-400/10"><div className="flex min-w-0 flex-1 items-center gap-4"><div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-teal-50 text-2xl text-teal-700">{card.icon}</div><div className="min-w-0 flex-1"><h3 className="truncate text-[15px] font-bold text-slate-800">{card.title}</h3><p className="mt-0.5 truncate text-xs font-medium text-slate-500">{card.description}</p></div></div><div className="ml-4 shrink-0 text-slate-300">{rightArrow}</div></button>;
+      }
       case 'suppliers':
         return (
           <button onClick={() => onSelectModule('suppliers')} className="group flex items-center justify-between p-5 bg-white border border-slate-200 rounded-2xl shadow-sm hover:shadow-md hover:border-fuchsia-300 transition-all text-left w-full h-full focus:outline-none focus:ring-4 focus:ring-slate-400/10">
@@ -324,13 +364,29 @@ export default function CompanyModule({
                 <svg className="w-6 h-6 text-sky-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" /></svg>
               </div>
               <div className="min-w-0 flex-1">
-                <h3 className="text-[15px] font-bold text-slate-800 truncate transition-colors group-hover:text-sky-800">Procurement (P.O.)</h3>
-                <p className="text-xs font-medium text-slate-500 truncate mt-0.5">Manage POs, verify deliveries & track.</p>
+                <h3 className="text-[15px] font-bold text-slate-800 truncate transition-colors group-hover:text-sky-800">P.O.</h3>
+                <p className="text-xs font-medium text-slate-500 truncate mt-0.5">Generate P.O.s, view the ledger and track fulfillment.</p>
               </div>
             </div>
             <div className="flex-shrink-0 ml-4 text-slate-300 group-hover:text-sky-500 transition-colors">{rightArrow}</div>
           </button>
         );
+      case 'importation':
+        return (
+          <button onClick={() => onSelectModule('importation')} className="group flex items-center justify-between p-5 bg-white border border-slate-200 rounded-2xl shadow-sm hover:shadow-md hover:border-cyan-300 transition-all text-left w-full h-full focus:outline-none focus:ring-4 focus:ring-cyan-400/10">
+            <div className="flex items-center gap-4 min-w-0 flex-1">
+              <div className="flex-shrink-0 w-12 h-12 rounded-xl flex items-center justify-center bg-cyan-50 text-cyan-700 text-2xl">↗</div>
+              <div className="min-w-0 flex-1"><h3 className="text-[15px] font-bold text-slate-800 truncate">Importation & Receiving</h3><p className="text-xs font-medium text-slate-500 truncate mt-0.5">Requisitions, shipments, customs and QC.</p></div>
+            </div><div className="flex-shrink-0 ml-4 text-slate-300">{rightArrow}</div>
+          </button>
+        );
+      case 'warehouse_ops':
+      case 'customer_pos':
+      case 'deliveries': {
+        const title = id === 'warehouse_ops' ? 'Warehouse & Cycle Counts' : id === 'customer_pos' ? 'Customer Orders & Fulfillment' : 'Delivery & Proof of Delivery';
+        const description = id === 'warehouse_ops' ? 'Bins, stock conditions, transfers and counts.' : id === 'customer_pos' ? 'Track Order Slip reservations and partial deliveries.' : 'FEFO picking, dispatch schedules and signed PODs.';
+        return <button onClick={() => onSelectModule(id)} className="group flex items-center justify-between p-5 bg-white border border-slate-200 rounded-2xl shadow-sm hover:shadow-md hover:border-cyan-300 transition-all text-left w-full h-full focus:outline-none focus:ring-4 focus:ring-cyan-400/10"><div className="flex items-center gap-4 min-w-0 flex-1"><div className="flex-shrink-0 w-12 h-12 rounded-xl flex items-center justify-center bg-cyan-50 text-cyan-700 text-2xl">{id === 'warehouse_ops' ? '▦' : id === 'customer_pos' ? '≡' : '→'}</div><div className="min-w-0 flex-1"><h3 className="text-[15px] font-bold text-slate-800 truncate">{title}</h3><p className="text-xs font-medium text-slate-500 truncate mt-0.5">{description}</p></div></div><div className="flex-shrink-0 ml-4 text-slate-300">{rightArrow}</div></button>;
+      }
       case 'inventory':
         return (
           <button onClick={() => onSelectModule('inventory')} className="group flex items-center justify-between p-5 bg-white border border-slate-200 rounded-2xl shadow-sm hover:shadow-md hover:border-blue-300 transition-all text-left w-full h-full focus:outline-none focus:ring-4 focus:ring-slate-400/10">
@@ -376,10 +432,43 @@ export default function CompanyModule({
             <div className="flex-shrink-0 ml-4 text-slate-300 group-hover:text-rose-500 transition-colors">{rightArrow}</div>
           </button>
         );
+
+      case 'generate_qr':
+        return (
+          <button onClick={() => onSelectModule('qr_system')} className="group flex items-center justify-between p-5 bg-white border border-slate-200 rounded-2xl shadow-sm hover:shadow-md hover:border-indigo-300 transition-all text-left w-full h-full focus:outline-none focus:ring-4 focus:ring-slate-400/10">
+            <div className="flex items-center gap-4 min-w-0 flex-1">
+              <div className="flex-shrink-0 w-12 h-12 bg-indigo-50 text-indigo-600 rounded-xl flex items-center justify-center group-hover:scale-105 transition-transform">
+                <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z" />
+                </svg>
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 className="text-[15px] font-bold text-slate-800 truncate transition-colors group-hover:text-indigo-800">QR Generator</h3>
+                <p className="text-xs font-medium text-slate-500 truncate mt-0.5">Generate QR codes and print product labels.</p>
+              </div>
+            </div>
+            <div className="flex-shrink-0 ml-4 text-slate-300 group-hover:text-indigo-500 transition-colors">{rightArrow}</div>
+          </button>
+        );
+        
       default:
         return null;
     }
   };
+
+  if (navigationOnly) {
+    const navigation = getWorkspaceNavigationGroups(navigationGroups, moduleOrder);
+    return <><nav className="erp-navigation" aria-label="Modules">
+      <button type="button" className={`erp-nav-item${activeModule === 'none' ? ' is-active' : ''}`} aria-current={activeModule === 'none' ? 'page' : undefined} data-workspace-link onClick={onWorkspace} title="Workspace overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="m3 10 9-7 9 7v11h-7v-7h-4v7H3z" /></svg><span className="erp-nav-label">Workspace overview</span></button>
+      {navigation.map(group => <div className="erp-nav-group" key={group.id}>
+        <p className="erp-nav-group-title erp-nav-label">{group.title}</p>
+        {group.items.map(item => <button type="button" data-workspace-link key={item.id} title={item.title} aria-current={activeModule === item.module ? 'page' : undefined} className={`erp-nav-item${activeModule === item.module ? ' is-active' : ''}`} onClick={() => onSelectModule(item.module)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={item.icon} /></svg><span className="erp-nav-label">{item.title}</span></button>)}
+      </div>)}
+      {navigationLoading && <p role="status" className="erp-nav-label px-3 py-2 text-xs text-slate-300">Loading company menu…</p>}
+      {navigationError && <p role="status" className="erp-nav-label px-3 py-2 text-xs text-amber-200">Company menu could not be loaded. Default groups are shown.</p>}
+      {canEditMenu && <button type="button" className="erp-nav-item erp-menu-edit-button" title="Edit company menu" disabled={navigationLoading} onClick={openMenuEditor}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="m16 3 5 5M3 21l4-1L21 6l-3-3L4 17z" /></svg><span className="erp-nav-label">Edit company menu</span></button>}
+    </nav>{renderMenuEditor()}</>;
+  }
 
   // --- WORKSPACE LIST VIEW (GATEWAY OFF) ---
   if (!isGateway) {
@@ -463,7 +552,7 @@ export default function CompanyModule({
                     </div>
                   </button>
                   
-                  {hasUsers && (
+                  {hasUsers && !isBuiltInCompany(company) && (
                     <button 
                       disabled={!!deletingCompany}
                       onClick={(e) => { void handleRemoveClick(e, company); }}
@@ -488,7 +577,7 @@ export default function CompanyModule({
 
   // --- GATEWAY VIEW (WITH DRAG & DROP) ---
   return (
-    <div className="min-h-screen bg-[#F8FAFC] flex flex-col items-center p-4 sm:p-8 font-sans selection:bg-slate-200 relative pb-24">
+    <div className="erp-workspace-home min-h-screen bg-[#F8FAFC] flex flex-col items-center p-4 sm:p-8 font-sans selection:bg-slate-200 relative pb-24">
       
       {/* TOAST MOVED TO TOP RIGHT */}
       {toast && (
@@ -500,7 +589,8 @@ export default function CompanyModule({
       {/* GATEWAY HEADER */}
       <div className="w-full max-w-[1440px] mx-auto px-6 lg:px-8 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-6 mb-10">
         <div className="w-full sm:w-auto">
-          <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">{selectedCompany} Workspace</h1>
+          <p className="erp-eyebrow">YOUR BUSINESS, CONNECTED</p>
+          <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">Workspace overview</h1>
           <p className="text-slate-500 text-sm mt-1">Logged in as <span className="font-bold text-slate-700">{loginUsername}</span> ({currentUser?.role || 'Admin'})</p>
         </div>
         <div className="flex flex-col sm:flex-row w-full sm:w-auto gap-3 shrink-0">
@@ -508,6 +598,12 @@ export default function CompanyModule({
           <button onClick={onLogout} className="flex-1 sm:flex-none w-full sm:w-auto px-4 sm:px-5 py-2.5 bg-slate-900 text-white hover:bg-slate-800 rounded-xl shadow-sm font-bold transition-colors text-sm text-center">Logout</button>
         </div>
       </div>
+
+      <div className="erp-workspace-intro">
+        <div><h2>Everything you need to keep business moving.</h2><p>Manage sales, stock and finance in one connected workspace. Choose a module to get started.</p></div>
+        {hasExecutive && <button type="button" className="erp-overview-action" onClick={() => onSelectModule('executive')}>View executive overview <span aria-hidden="true">↗</span></button>}
+      </div>
+      <div className="erp-module-toolbar"><div><h2>Your modules</h2><p>{isAdmin ? 'Open a module, or hold and drag a card to arrange your workspace.' : 'The tools available to your account.'}</p></div><div className="flex flex-wrap items-center gap-2">{canEditMenu && <button type="button" className="erp-overview-action erp-menu-edit-button" disabled={navigationLoading} onClick={openMenuEditor}>Edit company menu</button>}<label className="erp-module-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" /><path d="m16 16 5 5" /></svg><input type="search" aria-label="Find a module" placeholder="Find a module…" value={moduleSearch} onChange={event => setModuleSearch(event.target.value)} /></label></div></div>
 
       <DndContext 
         sensors={sensors} 
@@ -519,7 +615,7 @@ export default function CompanyModule({
           
           <div className="w-full max-w-[1440px] mx-auto px-6 lg:px-8 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
             
-            {moduleOrder.map(moduleId => (
+            {moduleOrder.filter(moduleId => matchesWorkspaceModule(moduleId, moduleSearch)).map(moduleId => (
               <SortableModuleCard key={moduleId} id={moduleId} disabled={!isAdmin}>
                 {renderModuleCard(moduleId)}
               </SortableModuleCard>
@@ -529,8 +625,11 @@ export default function CompanyModule({
         </SortableContext>
       </DndContext>
 
+      {moduleSearch.trim() && !moduleOrder.some(moduleId => matchesWorkspaceModule(moduleId, moduleSearch)) && <p role="status" className="erp-module-empty">No modules match “{moduleSearch}”. Try another name.</p>}
+
       {/* INJECT ONLINE WIDGET HERE */}
       {renderOnlineWidget()}
+      {renderMenuEditor()}
     </div>
   );
 }

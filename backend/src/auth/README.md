@@ -8,6 +8,6 @@ The document guard validates the signature and expiry, loads current user permis
 
 Demotion, suspension and deletion of an active Super Admin check the remaining active admins in the same serializable transaction as the write. Serialization conflicts retry at most three attempts, rechecking current records; a persistent conflict returns HTTP 409. This prevents concurrent management requests from removing the final active Super Admin.
 
-Production CORS allows `https://olten.vercel.app`. Add exact additional frontend origins using comma-separated `CORS_ORIGINS` or `FRONTEND_URL`; unconfigured preview deployments are rejected. Development includes the usual localhost Vite ports. Cross-origin cookies are disabled because the API uses bearer sessions.
+Production CORS allows `https://wilcarephil.vercel.app`. Add exact additional frontend origins using comma-separated `CORS_ORIGINS` or `FRONTEND_URL`; unconfigured preview deployments are rejected. Development includes the usual localhost Vite ports. Cross-origin cookies are disabled because the API uses bearer sessions. Sessions use the `wilcare` issuer; users must log in again after replacing a backend that issued Olten sessions.
 
 These guards cover documents, account administration and company management. Existing payroll, sales, inventory and other ERP controllers require a separate authorization migration before the entire ERP can be described as protected.

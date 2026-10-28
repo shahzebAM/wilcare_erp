@@ -1,5 +1,6 @@
 import { Injectable, BadRequestException, ConflictException, NotFoundException, ServiceUnavailableException, HttpException, Logger } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
+import type { Prisma } from '@prisma/client';
 import { GeminiService } from './gemini.service';
 import { DriveService } from './drive.service';
 import { ExpiryExtractorService } from './expiry-extractor.service';
@@ -46,6 +47,174 @@ export class DocumentService {
     if (company.length > 200) throw new BadRequestException('Invalid company header');
   }
 
+  async getImportLinks(company: string) {
+    this.requireCompany(company);
+    const docs = await prisma.document.findMany({
+      where: { company, status: 'ACTIVE' },
+      select: {
+        id: true,
+        originalName: true,
+        documentType: true,
+        expiryDate: true,
+        expiryStatus: true,
+        googleDriveLink: true,
+        importFileId: true,
+        shipmentId: true,
+        productId: true,
+        regulatoryStatus: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    return docs.map((doc) => ({
+      ...doc,
+      regulatoryStatus:
+        doc.expiryDate && doc.expiryDate < companyToday()
+          ? 'EXPIRED'
+          : doc.regulatoryStatus,
+    }));
+  }
+
+  async updateImportLinks(
+    id: string,
+    company: string,
+    body: {
+      importFileId?: string | null;
+      shipmentId?: string | null;
+      productId?: number | null;
+      regulatoryStatus?: string;
+      documentType?: string;
+    },
+  ) {
+    this.requireCompany(company);
+    if (
+      !body ||
+      typeof body !== 'object' ||
+      Array.isArray(body) ||
+      !/^\d+$/.test(id) ||
+      !Number.isSafeInteger(Number(id)) ||
+      Number(id) < 1 ||
+      Number(id) > 2147483647
+    ) {
+      throw new BadRequestException(
+        'A valid document and import link payload are required.',
+      );
+    }
+    for (const field of ['importFileId', 'shipmentId'] as const) {
+      if (
+        body[field] !== undefined &&
+        body[field] !== null &&
+        (typeof body[field] !== 'string' ||
+          !body[field].trim() ||
+          body[field].length > 100)
+      ) {
+        throw new BadRequestException(`Invalid ${field}.`);
+      }
+    }
+    if (
+      body.productId !== undefined &&
+      body.productId !== null &&
+      (!Number.isSafeInteger(body.productId) ||
+        body.productId <= 0 ||
+        body.productId > 2147483647)
+    )
+      throw new BadRequestException('Invalid product.');
+    if (
+      body.regulatoryStatus !== undefined &&
+      ![
+        'NOT_REQUESTED',
+        'REQUESTED',
+        'RECEIVED',
+        'UNDER_REVIEW',
+        'ACCEPTED',
+        'REJECTED',
+        'EXPIRED',
+      ].includes(body.regulatoryStatus)
+    ) {
+      throw new BadRequestException('Invalid regulatory document status.');
+    }
+    if (
+      body.documentType !== undefined &&
+      (typeof body.documentType !== 'string' || body.documentType.length > 150)
+    ) {
+      throw new BadRequestException(
+        'Document type must be at most 150 characters.',
+      );
+    }
+    return this.withCompanyWrite(company, () =>
+      prisma.$transaction(async (tx) => {
+        const doc = await tx.document.findFirst({
+          where: { id: Number(id), company, status: 'ACTIVE' },
+        });
+        if (!doc)
+          throw new NotFoundException('Document not found in this workspace.');
+        let importFileId =
+          body.importFileId === undefined
+            ? doc.importFileId
+            : body.importFileId;
+        const shipmentId =
+          body.shipmentId === undefined ? doc.shipmentId : body.shipmentId;
+        const productId =
+          body.productId === undefined ? doc.productId : body.productId;
+        if (shipmentId) {
+          const shipment = await tx.shipment.findFirst({
+            where: { id: shipmentId, company },
+          });
+          if (!shipment)
+            throw new BadRequestException(
+              'Shipment not found in this workspace.',
+            );
+          if (
+            body.importFileId !== undefined &&
+            importFileId !== shipment.importFileId
+          ) {
+            throw new BadRequestException(
+              'Shipment must belong to the selected import file.',
+            );
+          }
+          importFileId = shipment.importFileId;
+        }
+        if (
+          importFileId &&
+          !(await tx.importFile.findFirst({
+            where: { id: importFileId, company },
+          }))
+        ) {
+          throw new BadRequestException(
+            'Import file not found in this workspace.',
+          );
+        }
+        if (
+          productId &&
+          !(await tx.product.findFirst({ where: { id: productId, company } }))
+        ) {
+          throw new BadRequestException('Product not found in this workspace.');
+        }
+        const regulatoryStatus = body.regulatoryStatus ?? doc.regulatoryStatus;
+        if (
+          regulatoryStatus === 'ACCEPTED' &&
+          doc.expiryDate &&
+          doc.expiryDate < companyToday()
+        ) {
+          throw new BadRequestException(
+            'An expired document cannot be accepted.',
+          );
+        }
+        return tx.document.update({
+          where: { id: doc.id, company },
+          data: {
+            importFileId,
+            shipmentId,
+            productId,
+            regulatoryStatus,
+            ...(body.documentType !== undefined
+              ? { documentType: body.documentType.trim() || null }
+              : {}),
+          },
+        });
+      }),
+    );
+  }
+
   private async withCompanyWrite<T>(company: string, action: () => Promise<T>): Promise<T> {
     this.requireCompany(company);
     if (this.companyDeletions.has(company)) throw new ConflictException('This workspace is being deleted. Please wait.');
@@ -83,6 +252,31 @@ export class DocumentService {
     finally { if (this.companyDeletions.get(company) === operation) this.companyDeletions.delete(company); }
   }
 
+  private async assertNoFinanceHistory(
+    company: string,
+    client: Prisma.TransactionClient = prisma,
+  ) {
+    const where = { where: { company } };
+    const history = await Promise.all([
+      client.erpAuditLog.count(where),
+      client.landedCost.count(where),
+      client.productCostHistory.count(where),
+      client.financeDocument.count(where),
+      client.financePayment.count(where),
+      client.paymentRequest.count(where),
+      client.ledgerAccount.count(where),
+      client.accountingJournal.count(where),
+      client.accountingMapping.count(where),
+      client.bankReconciliation.count(where),
+      client.deviceAsset.count(where),
+      client.serviceVisit.count(where),
+    ]);
+    if (history.some((count) => count > 0))
+      throw new ConflictException(
+        'A workspace with Phase 3 financial, service or audit history cannot be deleted.',
+      );
+  }
+
   private async removeCompanyWorkspace(company: string) {
     const workspace = await prisma.company.findUnique({ where: { name: company } });
     if (!workspace) throw new NotFoundException('Workspace not found');
@@ -91,21 +285,62 @@ export class DocumentService {
     await Promise.allSettled([...(this.companyWrites.get(company) || [])]);
     const currentWorkspace = await prisma.company.findUnique({ where: { name: company }, select: { id: true } });
     if (!currentWorkspace || currentWorkspace.id !== workspace.id) throw new ConflictException('The workspace changed. Refresh and retry deletion.');
+    await this.assertNoFinanceHistory(company);
     let geminiFileIds: string[] = [];
-    const deleted = await this.driveService.deleteCompanyFolder(company, () => prisma.$transaction(async client => {
-      const current = await client.company.findUnique({ where: { name: company } });
-      if (!current || current.id !== workspace.id) throw new ConflictException('The workspace changed. Refresh and retry deletion.');
-      const docs = await client.document.findMany({ where: { company }, select: { geminiFileId: true } });
-      geminiFileIds = [...new Set(docs.flatMap(doc => doc.geminiFileId ? [doc.geminiFileId] : []))];
-      // Document cascades remove its expiry reminders and notifications.
-      await client.document.deleteMany({ where: { company } });
-      await client.searchHistory.deleteMany({ where: { company } });
-      return client.company.delete({ where: { id: workspace.id, name: company } });
-    }).catch(error => {
-      if (error instanceof HttpException) throw error;
-      if (error.code === 'P2025') throw new ConflictException('The workspace changed. Refresh and retry deletion.');
-      throw new ServiceUnavailableException('The Drive folder was removed, but database cleanup failed. Please retry workspace deletion.');
-    }), () => this.isRecreatedCompany(company, workspace.id));
+    const deleted = await this.driveService.deleteCompanyFolder(
+      company,
+      () =>
+        prisma
+          .$transaction(
+            async (client) => {
+              const current = await client.company.findUnique({
+                where: { name: company },
+              });
+              if (!current || current.id !== workspace.id)
+                throw new ConflictException(
+                  'The workspace changed. Refresh and retry deletion.',
+                );
+              await this.assertNoFinanceHistory(company, client);
+              const docs = await client.document.findMany({
+                where: { company },
+                select: { geminiFileId: true },
+              });
+              geminiFileIds = [
+                ...new Set(
+                  docs.flatMap((doc) =>
+                    doc.geminiFileId ? [doc.geminiFileId] : [],
+                  ),
+                ),
+              ];
+              // Document cascades remove its expiry reminders and notifications.
+              await client.document.deleteMany({ where: { company } });
+              await client.searchHistory.deleteMany({ where: { company } });
+              return client.company.delete({
+                where: { id: workspace.id, name: company },
+              });
+            },
+            { isolationLevel: 'Serializable' },
+          )
+          .catch((error: unknown) => {
+            if (error instanceof HttpException) throw error;
+            const code =
+              error && typeof error === 'object' && 'code' in error
+                ? error.code
+                : undefined;
+            if (code === 'P2025')
+              throw new ConflictException(
+                'The workspace changed. Refresh and retry deletion.',
+              );
+            if (code === 'P2034')
+              throw new ConflictException(
+                'The workspace changed during processing. Its database history was preserved. Refresh and retry.',
+              );
+            throw new ServiceUnavailableException(
+              'The Drive folder was removed, but database cleanup failed. Please retry workspace deletion.',
+            );
+          }),
+      () => this.isRecreatedCompany(company, workspace.id),
+    );
     this.deletedCompanies.set(company, workspace.id);
     this.invalidateSearch(company);
     // Remote AI index cleanup never delays the completed Drive/DB deletion and
@@ -236,6 +471,8 @@ export class DocumentService {
       const reminder = this.isReminderInactive(doc) ? undefined : this.configuredReminder(doc.reminders) || doc.reminders[0];
       const payload = this.expiryPayload(doc);
       return { ...file, documentId: doc.id, documentType: doc.documentType, documentNumber: doc.documentNumber,
+        importFileId: doc.importFileId, shipmentId: doc.shipmentId, productId: doc.productId,
+        regulatoryStatus: doc.expiryDate && doc.expiryDate < companyToday() ? 'EXPIRED' : doc.regulatoryStatus,
         expiryDate: doc.expiryDate, expiryStatus: payload.expiryStatus, expiryDateText: doc.expiryDateText,
         daysRemaining: payload.daysRemaining, reminderSetupPending: payload.reminderSetupPending,
         reminderDisabled: payload.reminderDisabled,

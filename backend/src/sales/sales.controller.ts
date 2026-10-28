@@ -1,10 +1,28 @@
-import { Controller, Get, Post, Patch, Body, Query, Param, Delete } from '@nestjs/common';
-import { PrismaClient } from '@prisma/client';
+import {
+  Controller,
+  Get,
+  Post,
+  Patch,
+  Body,
+  Query,
+  Param,
+  Delete,
+  ConflictException,
+  NotFoundException,
+  UseGuards,
+} from '@nestjs/common';
+import { Prisma, PrismaClient } from '@prisma/client';
+import { LegacyCompanyRecord, LegacyErpAccess, LegacyErpAuthGuard, LegacyReadModules, LegacyWriteModules } from '../auth/legacy-erp-auth.guard';
 
 const prisma = new PrismaClient();
-
 @Controller('sales')
+@UseGuards(LegacyErpAuthGuard)
+@LegacyErpAccess('sales')
 export class SalesController {
+
+  onModuleDestroy() {
+    return prisma.$disconnect();
+  }
 
   // ==========================================
   // CUSTOMER MANAGEMENT
@@ -65,6 +83,7 @@ export class SalesController {
   // ==========================================
 
   @Get('customer-categories')
+  @LegacyReadModules('products', 'inventory', 'master_inventory', 'warehouses')
   async getCategories(@Query('company') company: string) {
     return prisma.customerCategory.findMany({ where: { company } });
   }
@@ -75,11 +94,13 @@ export class SalesController {
   }
 
   @Delete('customer-categories/:id')
+  @LegacyCompanyRecord('customerCategory')
   async deleteCategory(@Param('id') id: string) {
     return prisma.customerCategory.delete({ where: { id } });
   }
 
   @Get('category-prices')
+  @LegacyReadModules('products', 'inventory', 'master_inventory', 'warehouses')
   async getCategoryPrices(
     @Query('company') company: string, 
     @Query('categoryName') categoryName: string
@@ -90,6 +111,7 @@ export class SalesController {
   }
 
   @Post('category-prices/bulk')
+  @LegacyWriteModules('products', 'inventory', 'master_inventory', 'warehouse', 'warehouses')
   async updateCategoryPrices(@Body() data: { company: string; categoryName: string; prices: { productId: number; price: number }[] }) {
     const { company, categoryName, prices } = data;
     
@@ -135,16 +157,103 @@ export class SalesController {
   }
 
   @Patch('customers/:id')
+  @LegacyCompanyRecord('customer')
   async updateCustomer(@Param('id') id: string, @Body() data: any) {
-    return prisma.customer.update({ where: { id }, data });
+    try {
+      return await prisma.$transaction(
+        async (tx) => {
+          const customer = await tx.customer.findUnique({
+            where: { id },
+            select: { company: true },
+          });
+          if (!customer) throw new NotFoundException('Customer not found.');
+          const identity = data as { id?: unknown; company?: unknown } | null;
+          const identityChanged =
+            (identity?.id !== undefined && identity.id !== id) ||
+            (identity?.company !== undefined &&
+              identity.company !== customer.company);
+          if (identityChanged) {
+            const company = customer.company;
+            const history = await Promise.all([
+              tx.financeDocument.count({
+                where: { company, direction: 'AR', partyId: id },
+              }),
+              tx.financePayment.count({
+                where: { company, direction: 'AR', partyId: id },
+              }),
+              tx.deviceAsset.count({ where: { company, customerId: id } }),
+            ]);
+            if (history.some((count) => count > 0))
+              throw new ConflictException(
+                'Customer identity and workspace cannot change after financial or device service history exists.',
+              );
+          }
+          return tx.customer.update({ where: { id }, data });
+        },
+        { isolationLevel: 'Serializable' },
+      );
+    } catch (error: unknown) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2034'
+      )
+        throw new ConflictException(
+          'The customer changed during processing. Refresh and try again.',
+        );
+      throw error;
+    }
   }
 
   @Delete('customers/:id')
+  @LegacyCompanyRecord('customer')
   async deleteCustomer(@Param('id') id: string) {
-    return prisma.customer.delete({ where: { id } });
+    try {
+      return await prisma.$transaction(
+        async (tx) => {
+          const customer = await tx.customer.findUnique({
+            where: { id },
+            select: { company: true },
+          });
+          if (!customer) throw new NotFoundException('Customer not found.');
+          const company = customer.company;
+          if (
+            await tx.customerOrder.count({ where: { customerId: id, company } })
+          ) {
+            throw new ConflictException(
+              'A customer with fulfillment order history cannot be deleted.',
+            );
+          }
+          const history = await Promise.all([
+            tx.financeDocument.count({
+              where: { company, direction: 'AR', partyId: id },
+            }),
+            tx.financePayment.count({
+              where: { company, direction: 'AR', partyId: id },
+            }),
+            tx.deviceAsset.count({ where: { company, customerId: id } }),
+          ]);
+          if (history.some((count) => count > 0))
+            throw new ConflictException(
+              'A customer with financial or device service history cannot be deleted.',
+            );
+          return tx.customer.delete({ where: { id } });
+        },
+        { isolationLevel: 'Serializable' },
+      );
+    } catch (error: unknown) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2034'
+      )
+        throw new ConflictException(
+          'The customer changed during processing. Refresh and try again.',
+        );
+      throw error;
+    }
   }
 
   @Patch('customers/:id/balance')
+  @LegacyCompanyRecord('customer')
   async updateCustomerBalance(@Param('id') id: string, @Body('amount') amount: number) {
     return prisma.customer.update({
       where: { id },

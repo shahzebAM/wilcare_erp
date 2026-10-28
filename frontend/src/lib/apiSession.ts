@@ -1,4 +1,4 @@
-const SESSION_KEY = 'olten_api_session';
+const SESSION_KEY = 'wilcare_api_session';
 
 type ApiSession = { accessToken: string; expiresAt: number };
 
@@ -13,7 +13,7 @@ export function clearApiSession() { sessionStorage.removeItem(SESSION_KEY); }
 
 export function expireApiSession() {
   clearApiSession();
-  window.dispatchEvent(new Event('olten-session-expired'));
+  window.dispatchEvent(new Event('wilcare-session-expired'));
 }
 
 export function getApiAuthHeaders(): Record<string, string> {

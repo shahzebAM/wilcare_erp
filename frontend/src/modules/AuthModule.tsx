@@ -43,7 +43,7 @@ const handleLogin = async (e: React.FormEvent) => {
           <p className="text-sm font-bold text-blue-600 mb-8 uppercase tracking-widest">Effective Date: September 2, 2026</p>
           
           <h2 className="text-lg font-bold mt-8 mb-3 text-slate-900">1. Introduction</h2>
-          <p className="text-slate-600">This Privacy Policy applies to the Olten Enterprise Resource Planning (ERP) application ("the App"). The App is intended for internal corporate use to manage personnel, payroll, attendance, and administrative documentation. This policy outlines how we collect, use, and protect your information.</p>
+          <p className="text-slate-600">This Privacy Policy applies to the Wilcare Enterprise Resource Planning (ERP) application ("the App"). The App is intended for internal corporate use to manage personnel, payroll, attendance, and administrative documentation. This policy outlines how we collect, use, and protect your information.</p>
           
           <div className="mt-12 pt-8 border-t border-slate-200">
             <a href="/" className="text-blue-600 font-bold hover:text-blue-800 transition-colors flex items-center gap-2">
@@ -67,7 +67,7 @@ const handleLogin = async (e: React.FormEvent) => {
       {/* 1. HEADER LOGO BOX (Pinned to Top) */}
       <div className="w-full max-w-2xl bg-white/90 backdrop-blur-md rounded-2xl px-6 py-4 sm:py-5 shadow-sm text-center relative z-10 mt-8 sm:mt-12 shrink-0 border border-white/50">
         <h1 className="text-xl sm:text-[28px] font-black text-[#303387] tracking-tight">
-          Surgicom Trading Corporation
+          Wilcare
         </h1>
       </div>
 

@@ -10,12 +10,21 @@ import { SalesController } from './sales/sales.controller';
 import { OrderSlipsController } from './sales/order-slips.controller';
 import { ProcurementController } from './sales/purchase-orders.controller';
 import { AuthSessionModule } from './auth/auth-session.module';
+import { PackingListsController } from './sales/packing-lists.controller';
+import { QuotationsController } from './sales/quotations.controller';
+import { ImportationModule } from './importation/importation.module';
+import { FulfillmentModule } from './fulfillment/fulfillment.module';
+import { FulfillmentPodController } from './fulfillment-pod.controller';
+import { Phase3Module } from './phase3/phase3.module';
 
 @Module({
   imports: [
     AuthSessionModule,
     EmployeesModule,
     DocumentationModule,
+    ImportationModule,
+    FulfillmentModule,
+    Phase3Module,
   ],
   controllers: [
     AppController,
@@ -24,7 +33,10 @@ import { AuthSessionModule } from './auth/auth-session.module';
     SettingsController,
     SalesController,
     OrderSlipsController,
-    ProcurementController
+    ProcurementController,
+    PackingListsController,
+    QuotationsController,
+    FulfillmentPodController,
   ],
   providers: [AppService],
 })

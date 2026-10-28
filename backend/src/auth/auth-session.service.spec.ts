@@ -1,4 +1,5 @@
 import { Logger, UnauthorizedException } from '@nestjs/common';
+import { createHmac } from 'node:crypto';
 import { AuthSessionService, SessionAdmin } from './auth-session.service';
 
 const mockPrisma = {
@@ -28,6 +29,7 @@ describe('AuthSessionService', () => {
   it('issues an eight-hour signed session without exposing password or permission claims', async () => {
     const session = service.issue(admin);
     const claims = JSON.parse(Buffer.from(session.accessToken.split('.')[1], 'base64url').toString());
+    expect(claims.iss).toBe('wilcare');
     expect(claims.exp - claims.iat).toBe(8 * 60 * 60);
     expect(claims.password).toBeUndefined();
     expect(claims.modules).toBeUndefined();
@@ -43,6 +45,16 @@ describe('AuthSessionService', () => {
     const parts = service.issue(admin).accessToken.split('.');
     const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
     parts[1] = Buffer.from(JSON.stringify({ ...claims, sub: 1 })).toString('base64url');
+    await expect(service.authenticate(`Bearer ${parts.join('.')}`)).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(mockPrisma.admin.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('rejects an Olten session even when it has a valid signature', async () => {
+    const parts = service.issue(admin).accessToken.split('.');
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+    parts[1] = Buffer.from(JSON.stringify({ ...claims, iss: 'olten' })).toString('base64url');
+    parts[2] = createHmac('sha256', 'test-session-secret-with-at-least-32-bytes')
+      .update(`${parts[0]}.${parts[1]}`).digest('base64url');
     await expect(service.authenticate(`Bearer ${parts.join('.')}`)).rejects.toBeInstanceOf(UnauthorizedException);
     expect(mockPrisma.admin.findUnique).not.toHaveBeenCalled();
   });

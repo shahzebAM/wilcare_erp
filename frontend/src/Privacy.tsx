@@ -6,7 +6,7 @@ export default function Privacy() {
 
       <h2 style={{ marginTop: '30px' }}>1. Introduction</h2>
       <p>
-        This Privacy Policy applies to the Olten Enterprise Resource Planning (ERP) application ("the App"). The App is intended for internal corporate use to manage personnel, payroll, attendance, and administrative documentation. This policy outlines how we collect, use, and protect your information to comply with Google Play Developer Policies.
+        This Privacy Policy applies to the Wilcare Enterprise Resource Planning (ERP) application ("the App"). The App is intended for internal corporate use to manage personnel, payroll, attendance, and administrative documentation. This policy outlines how we collect, use, and protect your information to comply with Google Play Developer Policies.
       </p>
 
       <h2 style={{ marginTop: '30px' }}>2. Information We Collect</h2>

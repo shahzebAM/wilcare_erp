@@ -1,5 +1,8 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { ProductCostHistory } from './phase3/ProfilePanels';
 import * as XLSX from 'xlsx';
+import { getApiAuthHeaders, expireApiSession } from '../lib/apiSession';
+import './catalog-customer-workspace.css';
 
 // --- INTERFACES ---
 interface Product { 
@@ -9,6 +12,7 @@ interface Product {
   sku: string; 
   category: string; 
   purchasePrice: number | string; 
+  landedCostReference?: number | string | null;
   sellingPrice: number | string; 
   categoryPrices?: Record<string, number | string>; 
   minQuantity: number; 
@@ -19,6 +23,7 @@ interface Product {
   imageUrl: string; 
   barcode: string; 
   currentStock: number; 
+  cmdn?: string | null;
   createdAt: string; 
   deletedAt: string | null; 
 }
@@ -62,12 +67,24 @@ interface CustomerCategory {
   name: string; 
 }
 
+interface ImportReceipt {
+  id: string;
+  goodsReceiptId: string;
+  poNumber: string;
+  osReference: string;
+  status: string;
+  supplierName: string;
+  items: { id: string; productId: number; sku: string; productName: string; confirmedQty: number;
+    batchNumber?: string | null; expirationDate?: string | null }[];
+}
+
 // --- PERSISTENT CACHE & VAULT ---
 let globalImageVault: Record<string, string> = {}; 
 let currentValidImages: Record<string, string> = {};
 let deletedImageVault: Record<string, string> = {}; 
 
-export default function MasterInventory({ selectedCompany, loginUsername, API_BASE_URL, onLogout, onBack }: any) {
+export default function MasterInventory({ selectedCompany, loginUsername, API_BASE_URL, onLogout, onBack, canFinance = false }: any) {
+  const [costHistoryProduct, setCostHistoryProduct] = useState<Product | null>(null);
   const isAuthorizedAdmin = loginUsername?.toLowerCase() === 'admin' || loginUsername?.toLowerCase() === 'ali' || loginUsername?.toLowerCase() === 'super admin';
 
   const [activeView, setActiveView] = useState<'products' | 'movements' | 'warehouses' | 'receiving'>('products');
@@ -76,6 +93,8 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [hubStock, setHubStock] = useState<WarehouseStock[]>([]);
   const [purchaseOrders, setPurchaseOrders] = useState<any[]>([]);
+  const [importReceipts, setImportReceipts] = useState<ImportReceipt[]>([]);
+  const [importReceivingError, setImportReceivingError] = useState('');
   const [customerCategories, setCustomerCategories] = useState<CustomerCategory[]>([]);
   
   const [selectedProductIds, setSelectedProductIds] = useState<number[]>([]);
@@ -83,7 +102,14 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
   const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' } | null>(null);
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
+ const [searchQuery, setSearchQuery] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // --- NEW: PAGINATION STATE ---
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 50;
+
+
 
   // --- FILTERS ---
   const [selectedHubFilter, setSelectedHubFilter] = useState<string>('ALL');
@@ -92,6 +118,11 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
   const [selectedPricingTierFilter, setSelectedPricingTierFilter] = useState<string>('');
 
   const uniqueCategories = Array.from(new Set(products.map(p => p.category))).sort();
+
+  // Reset pagination back to page 1 whenever you search or switch tabs
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchQuery, selectedCategoryFilter, selectedPricingTierFilter, selectedHubFilter, activeView]);
 
   // --- MODAL CONTROLLERS ---
   const [activeWarehouseModal, setActiveWarehouseModal] = useState<'REGISTER' | 'ADJUST' | 'TRANSFER' | null>(null);
@@ -107,7 +138,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
   const [placementPo, setPlacementPo] = useState<any>(null);
   const [placementDestinations, setPlacementDestinations] = useState<Record<string, string>>({});
 
-  const initialProductForm: any = { name: '', sku: '', category: 'General', purchasePrice: '', sellingPrice: 0, categoryPrices: {}, minQuantity: 10, reorderLevel: 20, unit: 'pcs', isActive: true, vatSetting: 'Vatable', imageUrl: '', barcode: '', previousImageUrl: '', initialQuantity: 0, warehouseId: '', batchNumber: '', expirationDate: '' };
+ const initialProductForm: any = { name: '', sku: '', cmdn: '', category: 'General', purchasePrice: '', sellingPrice: 0, categoryPrices: {}, minQuantity: 10, reorderLevel: 20, unit: 'pcs', isActive: true, vatSetting: 'Vatable', imageUrl: '', barcode: '', previousImageUrl: '', initialQuantity: 0, warehouseId: '', batchNumber: '', expirationDate: '' };
   const [productForm, setProductForm] = useState(initialProductForm);
   const [txForm, setTxForm] = useState({ reference: '', remarks: '', batchNumber: '', expirationDate: '' });
   
@@ -146,13 +177,16 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
 
   const fetchAllData = useCallback(async () => {
     try {
-      const [prodRes, movRes, whRes, stkRes, poRes, catRes] = await Promise.all([
-        fetch(`${API_BASE_URL}/products?company=${encodeURIComponent(selectedCompany)}`),
-        fetch(`${API_BASE_URL}/inventory-movements?company=${encodeURIComponent(selectedCompany)}`),
-        fetch(`${API_BASE_URL}/warehouses?company=${encodeURIComponent(selectedCompany)}`),
-        fetch(`${API_BASE_URL}/warehouse-stock?company=${encodeURIComponent(selectedCompany)}`),
-        fetch(`${API_BASE_URL}/procurement/purchase-orders?company=${encodeURIComponent(selectedCompany)}`),
-        fetch(`${API_BASE_URL}/sales/customer-categories?company=${encodeURIComponent(selectedCompany)}`)
+      const [prodRes, movRes, whRes, stkRes, poRes, catRes, grnRes] = await Promise.all([
+        fetch(`${API_BASE_URL}/products?company=${encodeURIComponent(selectedCompany)}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } }),
+        fetch(`${API_BASE_URL}/inventory-movements?company=${encodeURIComponent(selectedCompany)}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } }),
+        fetch(`${API_BASE_URL}/warehouses?company=${encodeURIComponent(selectedCompany)}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } }),
+        fetch(`${API_BASE_URL}/warehouse-stock?company=${encodeURIComponent(selectedCompany)}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } }),
+        fetch(`${API_BASE_URL}/procurement/purchase-orders?company=${encodeURIComponent(selectedCompany)}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } }),
+        fetch(`${API_BASE_URL}/sales/customer-categories?company=${encodeURIComponent(selectedCompany)}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } }),
+        fetch(`${API_BASE_URL}/importation/receiving-queue`, {
+          headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany },
+        }).catch(() => null)
       ]);
       
       let productsList: Product[] = [];
@@ -164,6 +198,14 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
       if (whRes.ok) setWarehouses(await whRes.json());
       if (stkRes.ok) setHubStock(await stkRes.json());
       if (poRes.ok) setPurchaseOrders(await poRes.json());
+      if (grnRes?.ok) {
+        setImportReceipts(await grnRes.json());
+        setImportReceivingError('');
+      } else {
+        setImportReceipts([]);
+        setImportReceivingError('Import receipt queue could not be loaded. Refresh before placing imported goods.');
+        if (grnRes?.status === 401) expireApiSession();
+      }
       
       if (catRes.ok) {
         const categories = await catRes.json();
@@ -175,7 +217,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
         
         try {
             const pricePromises = categories.map(async (cat: any) => {
-                const res = await fetch(`${API_BASE_URL}/sales/category-prices?company=${encodeURIComponent(selectedCompany)}&categoryName=${encodeURIComponent(cat.name)}`);
+                const res = await fetch(`${API_BASE_URL}/sales/category-prices?company=${encodeURIComponent(selectedCompany)}&categoryName=${encodeURIComponent(cat.name)}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany } });
                 if (res.ok) {
                     const data = await res.json();
                     return { catName: cat.name, data: Array.isArray(data) ? data : (data.data || []) };
@@ -212,7 +254,10 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
 
   useEffect(() => { fetchAllData(); }, [fetchAllData]);
 
-  const pendingReceivables = purchaseOrders.filter(po => po.status === 'Received' || po.status === 'Partially Received');
+  const pendingReceivables = [
+    ...purchaseOrders.filter(po => !po.importManaged && (po.status === 'Received' || po.status === 'Partially Received')),
+    ...importReceipts,
+  ];
 
   const toggleSelection = (id: number) => setSelectedProductIds((prev: number[]) => prev.includes(id) ? prev.filter(pid => pid !== id) : [...prev, id]);
   const toggleSelectAll = (filtered: Product[]) => {
@@ -226,7 +271,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
     
     setIsProcessing(true);
     try {
-      await Promise.all(ids.map(id => fetch(`${API_BASE_URL}/products/${id}`, { method: 'DELETE' })));
+      await Promise.all(ids.map(id => fetch(`${API_BASE_URL}/products/${id}`, { headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany }, method: 'DELETE' })));
       
       setProducts(prev => prev.filter(p => !ids.includes(p.id)));
       setSelectedProductIds(prev => prev.filter(id => !ids.includes(id)));
@@ -308,6 +353,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
     const cleanPayload: any = {
       name: productForm.name,
       sku: productForm.sku,
+      cmdn: productForm.cmdn || null, // <--- ADD THIS LINE
       category: productForm.category || 'General',
       purchasePrice: parseFloat(String(productForm.purchasePrice)) || 0,
       sellingPrice: 0,
@@ -360,7 +406,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
         const url = productModal.editingId ? `${API_BASE_URL}/products/${productModal.editingId}` : `${API_BASE_URL}/products`;
         const res = await fetch(url, { 
           method: productModal.editingId ? 'PATCH' : 'POST', 
-          headers: { 'Content-Type': 'application/json' }, 
+          headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' },
           body: JSON.stringify(cleanPayload) 
         });
         if (!res.ok) throw new Error(`Product sync failed (${res.status})`);
@@ -372,7 +418,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
             const pricePromises = Object.entries(sanitizedPricesToSave).map(([catName, price]) => {
                 return fetch(`${API_BASE_URL}/sales/category-prices/bulk`, {
                     method: 'POST', 
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' },
                     body: JSON.stringify({ 
                         company: selectedCompany, 
                         categoryName: catName, 
@@ -440,7 +486,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
       try {
           const res = await fetch(`${API_BASE_URL}/sales/category-prices/bulk`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' },
               body: JSON.stringify({ 
                 company: selectedCompany, 
                 categoryName: bulkPricingModal.tier, 
@@ -482,8 +528,8 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
 
     try {
       await Promise.all([
-        fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: warehouseId, productId: prod.id, sku: prod.sku, quantity: deltaQty }) }),
-        fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: 'ADJUST', quantity: absQty, previousStock: currentHubStock, newStock: currentHubStock + deltaQty, reference: 'Direct Hub Adjustment', remarks: remarks, user: loginUsername, company: selectedCompany, warehouseId: warehouseId }) })
+        fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: warehouseId, productId: prod.id, sku: prod.sku, quantity: deltaQty }) }),
+        fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: 'ADJUST', quantity: absQty, previousStock: currentHubStock, newStock: currentHubStock + deltaQty, reference: 'Direct Hub Adjustment', remarks: remarks, user: loginUsername, company: selectedCompany, warehouseId: warehouseId }) })
       ]);
       showToast("Warehouse stock successfully adjusted.", "success");
       fetchAllData();
@@ -494,6 +540,27 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
     e.preventDefault();
     if (!placementPo) return;
     setIsProcessing(true);
+
+    if (placementPo.goodsReceiptId) {
+      try {
+        const response = await fetch(`${API_BASE_URL}/importation/receipts/${placementPo.goodsReceiptId}/place`, {
+          method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ placements: placementPo.items.map((item: ImportReceipt['items'][number]) => ({
+            receiptLineId: item.id, warehouseId: placementDestinations[item.id] || 'MASTER', quantity: item.confirmedQty,
+          })) }),
+        });
+        if (response.status === 401) expireApiSession();
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.message || 'Stock placement failed.');
+        setPlacementPo(null);
+        setPlacementDestinations({});
+        showToast('QC accepted stock placed successfully.', 'success');
+        await fetchAllData();
+      } catch (error: unknown) {
+        showToast(error instanceof Error ? error.message : 'Stock placement failed.', 'error');
+      } finally { setIsProcessing(false); }
+      return;
+    }
 
     const apiPromises: Promise<any>[] = []; 
     let nextProducts = [...products];
@@ -517,8 +584,8 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
           currentMasterStock += q;
           if(pIdx > -1) nextProducts[pIdx].currentStock = currentMasterStock;
           
-          apiPromises.push(fetch(`${API_BASE_URL}/products/${prod.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ currentStock: currentMasterStock }) }));
-          apiPromises.push(fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: 'RECEIVE', quantity: q, previousStock: prevMaster, newStock: currentMasterStock, reference: placementPo.poNumber, remarks: `Supplier: ${placementPo.supplierName || 'Unknown'}`, user: loginUsername, company: selectedCompany, warehouseId: null }) }));
+          apiPromises.push(fetch(`${API_BASE_URL}/products/${prod.id}`, { method: 'PATCH', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ currentStock: currentMasterStock }) }));
+          apiPromises.push(fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: 'RECEIVE', quantity: q, previousStock: prevMaster, newStock: currentMasterStock, reference: placementPo.poNumber, remarks: `Supplier: ${placementPo.supplierName || 'Unknown'}`, user: loginUsername, company: selectedCompany, warehouseId: null }) }));
         } else {
           const dIdx = nextHubStock.findIndex(h => String(h.warehouseId) === String(destId) && Number(h.productId) === Number(prod.id));
           const prevHubStock = dIdx > -1 ? nextHubStock[dIdx].quantity : 0;
@@ -527,13 +594,13 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
           if(dIdx > -1) nextHubStock[dIdx].quantity = newHubStock;
           else nextHubStock.push({ id: 'temp', warehouseId: destId, productId: prod.id, sku: prod.sku, quantity: q });
 
-          apiPromises.push(fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: destId, productId: prod.id, sku: prod.sku, quantity: q }) }));
-          apiPromises.push(fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: 'RECEIVE', quantity: q, previousStock: prevHubStock, newStock: newHubStock, reference: placementPo.poNumber, remarks: `Supplier: ${placementPo.supplierName || 'Unknown'}`, user: loginUsername, company: selectedCompany, warehouseId: destId }) }));
+          apiPromises.push(fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: destId, productId: prod.id, sku: prod.sku, quantity: q }) }));
+          apiPromises.push(fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: 'RECEIVE', quantity: q, previousStock: prevHubStock, newStock: newHubStock, reference: placementPo.poNumber, remarks: `Supplier: ${placementPo.supplierName || 'Unknown'}`, user: loginUsername, company: selectedCompany, warehouseId: destId }) }));
         }
       }
 
       apiPromises.push(fetch(`${API_BASE_URL}/procurement/purchase-orders/${placementPo.id}/status`, { 
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'Stocked', user: loginUsername }) 
+        method: 'PATCH', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'Stocked', user: loginUsername })
       }));
 
       setProducts(nextProducts);
@@ -594,9 +661,9 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
 
     try {
        await Promise.all([
-          fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: hubTransferForm.sourceId, productId: prod.id, sku: prod.sku, quantity: -qty }) }),
-          fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: hubTransferForm.destId, productId: prod.id, sku: prod.sku, quantity: qty }) }),
-          fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: 'TRANSFER', quantity: qty, previousStock: currentSourceStock, newStock: currentSourceStock - qty, reference: 'Inter-Hub Transfer', remarks: `From WH-${hubTransferForm.sourceId.padStart(3,'0')} to WH-${hubTransferForm.destId.padStart(3,'0')}`, user: loginUsername, company: selectedCompany, warehouseId: hubTransferForm.destId }) })
+          fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: hubTransferForm.sourceId, productId: prod.id, sku: prod.sku, quantity: -qty }) }),
+          fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: hubTransferForm.destId, productId: prod.id, sku: prod.sku, quantity: qty }) }),
+          fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: 'TRANSFER', quantity: qty, previousStock: currentSourceStock, newStock: currentSourceStock - qty, reference: 'Inter-Hub Transfer', remarks: `From WH-${hubTransferForm.sourceId.padStart(3,'0')} to WH-${hubTransferForm.destId.padStart(3,'0')}`, user: loginUsername, company: selectedCompany, warehouseId: hubTransferForm.destId }) })
        ]);
        showToast("Transfer successful.", "success");
        setHubTransferForm({ sourceId: '', destId: '', productId: '', quantity: '' });
@@ -622,11 +689,110 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
     } catch (error) { showToast("Failed to export Excel file.", "error"); }
   };
 
+  // --- BULK EXCEL IMPORT LOGIC ---
+  const handleImportExcel = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    
+    if (!window.confirm("Import catalog? Existing SKUs will have their names, cost prices, and stock updated. New SKUs will be created.")) {
+       if (fileInputRef.current) fileInputRef.current.value = '';
+       return;
+    }
+
+    setIsProcessing(true);
+    const reader = new FileReader();
+    
+    reader.onload = async (evt) => {
+      try {
+        const bstr = evt.target?.result;
+        const wb = XLSX.read(bstr, { type: 'binary' });
+        const wsname = wb.SheetNames[0];
+        const data: any[] = XLSX.utils.sheet_to_json(wb.Sheets[wsname]);
+
+        let successCount = 0;
+        let errorCount = 0;
+
+        const importPromises = data.map(async (row) => {
+          // Smart column header matching (works with your exported file or a fresh template)
+          const sku = String(row['SKU'] || row['sku'] || '').trim();
+          const name = String(row['Product Name'] || row['Name'] || row['name'] || '').trim();
+          const qty = parseInt(row['Master Stock'] || row['Qty'] || row['Quantity'] || row['qty'] || 0, 10) || 0;
+          const costPrice = parseFloat(row['Cost Price (₱)'] || row['Cost Price'] || row['Cost'] || 0) || 0;
+
+          if (!sku || !name) return; // Skip empty rows
+
+          const existingProd = products.find(p => p.sku.toUpperCase() === sku.toUpperCase());
+
+          try {
+              if (existingProd) {
+                  // UPDATE EXISTING PRODUCT
+                  await fetch(`${API_BASE_URL}/products/${existingProd.id}`, {
+                      method: 'PATCH',
+                      headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ name, purchasePrice: costPrice, currentStock: qty })
+                  });
+              } else {
+                  // CREATE NEW PRODUCT
+                  const payload = {
+                    sku, name, purchasePrice: costPrice, company: selectedCompany,
+                    category: 'General', sellingPrice: 0, minQuantity: 10, reorderLevel: 20, 
+                    unit: 'pcs', vatSetting: 'NONE', barcode: sku.toUpperCase(),
+                    initialQuantity: qty, username: loginUsername
+                  };
+                  await fetch(`${API_BASE_URL}/products`, {
+                      method: 'POST',
+                      headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' },
+                      body: JSON.stringify(payload)
+                  });
+              }
+              successCount++;
+          } catch (err) {
+              errorCount++;
+          }
+        });
+
+        await Promise.all(importPromises);
+        showToast(`Import complete. Success: ${successCount}. Errors: ${errorCount}.`, successCount > 0 ? 'success' : 'error');
+        fetchAllData();
+      } catch (error) {
+        showToast("Error processing Excel file.", "error");
+      } finally {
+        setIsProcessing(false);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      }
+    };
+    reader.readAsBinaryString(file);
+  };
+
+  // --- DOWNLOAD BLANK TEMPLATE LOGIC ---
+  const handleDownloadTemplate = () => {
+    try {
+      // Creates a clean template with exactly one example row
+      const templateData = [{
+        "SKU": "EXAMPLE-001", 
+        "Product Name": "Sample Surgical Tool", 
+        "Master Stock": 50, 
+        "Cost Price (₱)": 1250.00
+      }];
+      const ws = XLSX.utils.json_to_sheet(templateData);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Import_Template");
+      XLSX.writeFile(wb, `Product_Import_Template.xlsx`);
+      showToast("Template downloaded successfully.", "success");
+    } catch (error) { 
+      showToast("Failed to download template.", "error"); 
+    }
+  };
+
   const filteredProducts = products.filter(p => {
     const matchesSearch = p.name.toLowerCase().includes(searchQuery.toLowerCase()) || p.sku.toLowerCase().includes(searchQuery.toLowerCase());
     const matchesCategory = selectedCategoryFilter === 'ALL' || p.category === selectedCategoryFilter;
     return matchesSearch && matchesCategory;
   });
+
+  // --- NEW: SLICE FOR PAGINATION ---
+  const totalPages = Math.max(1, Math.ceil(filteredProducts.length / itemsPerPage));
+  const paginatedProducts = filteredProducts.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
 
   const filteredProductsForDropdown = products.filter(p => p.name.toLowerCase().includes(productSearchTerm.toLowerCase()) || p.sku.toLowerCase().includes(productSearchTerm.toLowerCase()));
   const filteredProductsForHubDropdown = products.filter(p => p.name.toLowerCase().includes(hubTransferSearch.toLowerCase()) || p.sku.toLowerCase().includes(hubTransferSearch.toLowerCase()));
@@ -651,7 +817,8 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
   });
 
   return (
-    <div className="flex h-screen w-full bg-[#F8FAFC] font-sans text-slate-900 overflow-hidden">
+    <div className="directory-workspace catalog-workspace flex h-screen w-full bg-[#F8FAFC] font-sans text-slate-900 overflow-hidden">
+      {canFinance && costHistoryProduct && <ProductCostHistory api={API_BASE_URL} company={selectedCompany} product={costHistoryProduct} onClose={() => setCostHistoryProduct(null)} />}
       
       {toast && (
         <div className={`fixed bottom-6 right-6 z-[100] px-5 py-3.5 rounded-xl shadow-xl font-bold text-sm transition-all ${toast.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'}`}>
@@ -666,12 +833,12 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
       )}
 
       {/* SIDEBAR NAVIGATION */}
-      <aside className={`fixed inset-y-0 left-0 z-50 bg-[#0F172A] text-slate-300 w-64 transition-transform duration-300 md:relative md:translate-x-0 flex flex-col shadow-xl ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'}`}>
-        <div className="h-20 flex items-center px-6 border-b border-slate-800 bg-[#0B1120]">
+      <aside aria-label="Inventory views" className="directory-tabs fixed inset-y-0 left-0 z-50 bg-[#0F172A] text-slate-300 w-64 md:relative flex flex-col shadow-xl">
+        <div className="directory-tabs-brand h-20 flex items-center px-6 border-b border-slate-800 bg-[#0B1120]">
           <h1 className="text-xl font-black text-white uppercase tracking-wider truncate">{selectedCompany}</h1>
         </div>
-        <div className="flex-1 p-4 space-y-2 overflow-y-auto">
-          <div className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-2 mt-4 ml-2">Core Modules</div>
+        <div className="directory-tab-links flex-1 p-4 space-y-2 overflow-y-auto">
+          <div className="directory-tabs-label text-[10px] font-black text-slate-500 uppercase tracking-widest mb-2 mt-4 ml-2">Core Modules</div>
           {[
             { id: 'products', label: 'Master Catalog' },
             { id: 'movements', label: 'Stock Ledger' },
@@ -689,35 +856,36 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
       </aside>
 
       {/* MAIN CONTENT AREA */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="directory-body flex-1 flex flex-col min-w-0">
         
         {/* RESPONSIVE HEADER */}
-        <header className="h-20 bg-white border-b border-slate-200 flex items-center justify-between px-4 sm:px-6 shrink-0 shadow-sm z-10 gap-2">
+        <header className="directory-heading h-20 bg-white border-b border-slate-200 flex items-center justify-between px-4 sm:px-6 shrink-0 shadow-sm z-10 gap-2">
           <div className="flex items-center gap-3 min-w-0">
-            <button onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)} className="md:hidden font-black text-slate-900 px-3 py-2 bg-slate-100 rounded-lg text-xs shrink-0">MENU</button>
-            <div className="truncate hidden sm:block">
+            <button onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)} className="catalog-menu-toggle md:hidden font-black text-slate-900 px-3 py-2 bg-slate-100 rounded-lg text-xs shrink-0">MENU</button>
+            <div className="directory-title truncate hidden sm:block">
               <h2 className="text-xl sm:text-2xl font-black text-slate-900 uppercase tracking-tighter truncate">
                 {activeView === 'products' ? 'Product Catalog' : activeView === 'movements' ? 'Historical Ledger' : activeView === 'warehouses' ? 'Warehouses' : 'Physical Receiving'}
               </h2>
             </div>
           </div>
-          <div className="flex gap-2 shrink-0">
+          <div className="directory-heading-actions flex gap-2 shrink-0">
             <button onClick={onBack} className="px-4 py-2 bg-white border border-slate-300 text-slate-700 font-bold uppercase text-[10px] sm:text-xs rounded-xl hover:bg-slate-50 transition-colors shadow-sm">Gateway</button>
             <button onClick={onLogout} className="px-4 py-2 bg-rose-500 text-white font-bold uppercase text-[10px] sm:text-xs rounded-xl hover:bg-rose-600 transition-colors shadow-sm">Logout</button>
           </div>
         </header>
 
        {/* LOCKED MAIN CONTAINER PREVENTS EXTERNAL SCROLLING */}
-        <main className="flex-1 flex flex-col bg-[#F8FAFC] overflow-hidden min-h-0">
+        <main className="directory-main flex-1 flex flex-col bg-[#F8FAFC] overflow-hidden min-h-0">
           
         {/* VIEW: PRODUCTS */}
           {activeView === 'products' && (
-            <div className="flex flex-col flex-1 h-full w-full max-w-[1600px] mx-auto animate-in fade-in duration-300 p-4 sm:p-6 gap-4 min-h-0">
+            <div className="catalog-products flex flex-col flex-1 h-full w-full max-w-[1600px] mx-auto animate-in fade-in duration-300 p-4 sm:p-6 gap-4 min-h-0">
               
-              <div className="flex flex-col lg:flex-row justify-between gap-4 bg-white p-4 rounded-2xl border border-slate-200 shadow-sm shrink-0">
-                <div className="flex flex-1 flex-col xl:flex-row gap-3">
+              <div className="catalog-toolbar flex flex-col lg:flex-row justify-between gap-4 bg-white p-4 rounded-2xl border border-slate-200 shadow-sm shrink-0">
+                <div className="catalog-filters flex flex-1 flex-col xl:flex-row gap-3">
                   {/* CATEGORY FILTER DROPDOWN */}
                   <select 
+                    aria-label="Product category"
                     value={selectedCategoryFilter} 
                     onChange={(e) => setSelectedCategoryFilter(e.target.value)} 
                     className="px-4 py-2.5 bg-white border border-slate-200 rounded-xl text-xs font-bold uppercase outline-none focus:ring-2 focus:ring-blue-500 shadow-sm cursor-pointer text-slate-700 w-full xl:w-48 appearance-none"
@@ -730,6 +898,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
 
                   {/* CUSTOMER PRICING TIER FILTER DROPDOWN */}
                   <select 
+                    aria-label="Customer pricing tier"
                     value={selectedPricingTierFilter} 
                     onChange={(e) => setSelectedPricingTierFilter(e.target.value)} 
                     className="px-4 py-2.5 bg-white border border-slate-200 rounded-xl text-xs font-bold uppercase outline-none focus:ring-2 focus:ring-amber-500 shadow-sm cursor-pointer text-slate-700 w-full xl:w-48 appearance-none"
@@ -741,6 +910,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                   </select>
 
                   <select 
+                    aria-label="Warehouse hub"
                     value={selectedHubFilter} 
                     onChange={(e) => setSelectedHubFilter(e.target.value)} 
                     className="px-4 py-2.5 bg-white border border-slate-200 rounded-xl text-xs font-bold uppercase outline-none focus:ring-2 focus:ring-blue-500 shadow-sm cursor-pointer text-slate-700 w-full xl:w-48 appearance-none"
@@ -750,12 +920,26 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                   </select>
                 </div>
                 
-                <div className="flex flex-wrap gap-2 shrink-0">
+                <div className="catalog-actions flex flex-wrap gap-2 shrink-0">
                   {isAuthorizedAdmin && customerCategories.length > 0 && (
                     <button onClick={() => setBulkPricingModal({ isOpen: true, tier: customerCategories[0]?.name || '', percentage: '' })} className="w-full sm:w-auto px-5 py-2.5 bg-amber-50 border border-amber-200 text-amber-700 font-bold uppercase text-[10px] rounded-xl shadow-sm hover:bg-amber-100 transition-colors">Bulk Pricing</button>
                   )}
-                  {isAuthorizedAdmin && (
-                    <button onClick={handleExportExcel} className="w-full sm:w-auto px-5 py-2.5 bg-white border border-slate-200 text-slate-700 font-bold uppercase text-[10px] rounded-xl shadow-sm hover:bg-slate-50 transition-colors">Export Excel</button>
+{isAuthorizedAdmin && (
+                    <>
+                      <button onClick={handleDownloadTemplate} className="w-full sm:w-auto px-5 py-2.5 bg-slate-100 border border-slate-200 text-slate-700 font-bold uppercase text-[10px] rounded-xl shadow-sm hover:bg-slate-200 transition-colors">
+                        Get Template
+                      </button>
+
+                      <input type="file" accept=".xlsx, .xls, .csv" className="hidden" ref={fileInputRef} onChange={handleImportExcel} />
+                      
+                      <button onClick={() => fileInputRef.current?.click()} disabled={isProcessing} className="w-full sm:w-auto px-5 py-2.5 bg-emerald-50 border border-emerald-200 text-emerald-700 font-bold uppercase text-[10px] rounded-xl shadow-sm hover:bg-emerald-100 transition-colors disabled:opacity-50">
+                        {isProcessing ? 'Importing...' : 'Import Excel'}
+                      </button>
+                      
+                      <button onClick={handleExportExcel} className="w-full sm:w-auto px-5 py-2.5 bg-white border border-slate-200 text-slate-700 font-bold uppercase text-[10px] rounded-xl shadow-sm hover:bg-slate-50 transition-colors">
+                        Export Excel
+                      </button>
+                    </>
                   )}
                   <button onClick={() => { setProductForm(initialProductForm); setProductModal({ isOpen: true, editingId: null }); }} className="w-full sm:w-auto px-5 py-2.5 bg-blue-600 text-white font-bold uppercase text-[10px] rounded-xl shadow-sm hover:bg-blue-700 transition-colors">+ Register Item</button>
                 </div>
@@ -777,9 +961,9 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
               )}
 
               {/* STICKY SCROLLING TABLE CONTAINER */}
-              <div className="flex-1 bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex flex-col min-h-0">
-                <div className="flex-1 overflow-auto w-full relative">
-                  <table className="w-full text-left text-xs border-collapse table-fixed min-w-[1200px]">
+              <div className="directory-table-card flex-1 bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex flex-col min-h-0">
+                <div className="directory-table-scroll flex-1 overflow-auto w-full relative" tabIndex={0} role="region" aria-label="Product catalog table">
+                  <table className="catalog-table w-full text-left text-xs border-collapse table-fixed min-w-[1200px]">
                     <thead className="bg-slate-50 sticky top-0 z-20 shadow-sm border-b border-slate-200">
                       <tr>
                         <th className="py-3 px-4 w-12 text-center border-b border-slate-200 align-middle">
@@ -790,6 +974,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                             <svg className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
                             <input 
                               type="text" 
+                              aria-label="Search products by SKU or name"
                               placeholder="SEARCH SKU OR NAME..." 
                               value={searchQuery} 
                               onChange={(e) => setSearchQuery(e.target.value)} 
@@ -812,7 +997,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                       {filteredProducts.length === 0 ? (
                         <tr><td colSpan={7} className="py-12 text-center text-slate-400 font-medium">No items found matching your filters.</td></tr>
                       ) : (
-                        filteredProducts.map(p => {
+                        paginatedProducts.map(p => {
                           const displayPrice = Number(p.categoryPrices?.[selectedPricingTierFilter] || 0);
                             
                           return (
@@ -827,9 +1012,14 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                                   ) : (
                                     <div className="w-10 h-10 rounded-lg bg-slate-50 border border-slate-200 flex items-center justify-center text-[8px] font-bold uppercase text-center text-slate-300 cursor-pointer shrink-0" onClick={() => { if(globalImageVault[p.sku]) setPreviewImage(globalImageVault[p.sku]); }}>No Img</div>
                                   )}
-                                  <div className="min-w-0 flex flex-col items-start">
-                                    <div className="font-bold text-xs text-slate-900 uppercase leading-tight truncate">{p.name}</div>
-                                    <div className="mt-1 font-mono text-xs font-black text-indigo-700 bg-indigo-50 px-2.5 py-1 rounded-md border border-indigo-100 truncate shadow-sm">{p.sku}</div>
+                             <div className="min-w-0 flex flex-col items-start w-full">
+                                    <div className="font-bold text-xs text-slate-900 uppercase leading-tight whitespace-normal break-words max-w-[300px] xl:max-w-full">{p.name}</div>
+                                    <div className="mt-1 font-mono text-xs font-black text-indigo-700 bg-indigo-50 px-2.5 py-1 rounded-md border border-indigo-100 truncate shadow-sm inline-block">{p.sku}</div>
+                                    {p.cmdn && (
+                                      <div className="mt-1 font-mono text-[10px] font-black text-fuchsia-700 bg-fuchsia-50 px-2 py-0.5 rounded border border-fuchsia-200 truncate shadow-sm inline-block tracking-widest">
+                                        CMDN: {p.cmdn}
+                                      </div>
+                                    )}
                                   </div>
                                 </div>
                               </td>
@@ -844,6 +1034,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                                   <span className="text-[9px] uppercase tracking-widest text-emerald-600/70">COST</span>
                                   ₱{Number(p.purchasePrice).toFixed(2)}
                                 </div>
+                                {canFinance && <button type="button" className="mt-2 block text-left text-[10px] font-semibold text-cyan-700 hover:underline" onClick={() => setCostHistoryProduct(p)}>{p.landedCostReference == null ? 'View landed cost history' : `Landed reference: ₱${Number(p.landedCostReference).toFixed(2)}`}</button>}
                               </td>
                               <td className="py-2.5 px-4 align-middle text-center">
                                 <div className={`font-mono text-sm font-black ${p.currentStock <= p.reorderLevel ? 'text-rose-600' : 'text-slate-700'}`}>{p.currentStock} <span className="text-[9px] text-slate-400 font-sans">{p.unit}</span></div>
@@ -894,16 +1085,35 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                 </div>
               </div>
               
-              {/* COMPACT FOOTER */}
-              <div className="p-2 bg-slate-50 flex items-center justify-between text-[10px] font-bold text-slate-500 uppercase tracking-widest shrink-0 rounded-b-2xl -mt-4 border-t border-slate-200">
-                <div className="px-2">Showing {filteredProducts.length} Items</div>
+          {/* COMPACT FOOTER WITH PAGINATION */}
+              <div className="directory-pagination p-3 bg-slate-50 flex items-center justify-between text-[10px] font-bold text-slate-500 uppercase tracking-widest shrink-0 rounded-b-2xl -mt-4 border-t border-slate-200">
+                <div className="px-2">
+                  Showing {(currentPage - 1) * itemsPerPage + 1} to {Math.min(currentPage * itemsPerPage, filteredProducts.length)} of {filteredProducts.length}
+                </div>
+                <div className="flex gap-2 pr-2">
+                  <button 
+                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))} 
+                    disabled={currentPage === 1}
+                    className="px-4 py-1.5 bg-white border border-slate-300 text-slate-700 rounded-md text-xs font-black uppercase tracking-widest disabled:opacity-30 transition-all hover:bg-slate-100"
+                  >
+                    Prev
+                  </button>
+                  <button 
+                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} 
+                    disabled={currentPage === totalPages}
+                    className="px-4 py-1.5 bg-white border border-slate-300 text-slate-700 rounded-md text-xs font-black uppercase tracking-widest disabled:opacity-30 transition-all hover:bg-slate-100"
+                  >
+                    Next
+                  </button>
+                </div>
               </div>
             </div>
           )}
 
           {/* VIEW: RECEIVING (NEW P.O. PLACEMENT QUEUE) */}
           {activeView === 'receiving' && (
-            <div className="max-w-7xl mx-auto space-y-6 animate-in fade-in duration-300 p-4 sm:p-6">
+            <div className="catalog-receiving max-w-7xl mx-auto space-y-6 animate-in fade-in duration-300 p-4 sm:p-6">
+              {importReceivingError && <p role="alert" className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">{importReceivingError}</p>}
               <div className="bg-white border border-slate-200 rounded-2xl shadow-sm flex flex-col flex-1 overflow-hidden relative">
                 <div className="p-4 border-b border-slate-200 bg-slate-50 flex justify-between items-center shrink-0">
                   <div>
@@ -968,10 +1178,10 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
 
          {/* VIEW: MOVEMENTS (LEDGER) */}
           {activeView === 'movements' && (
-            <div className="flex flex-col flex-1 h-full w-full max-w-[1600px] mx-auto animate-in fade-in duration-300 p-4 sm:p-6 gap-4 min-h-0">
+            <div className="catalog-ledger flex flex-col flex-1 h-full w-full max-w-[1600px] mx-auto animate-in fade-in duration-300 p-4 sm:p-6 gap-4 min-h-0">
               
               {/* FILTERS CONTAINER */}
-              <div className="flex flex-col sm:flex-row flex-wrap gap-4 items-end bg-white p-4 rounded-2xl border border-slate-200 shadow-sm shrink-0">
+              <div className="catalog-ledger-filters flex flex-col sm:flex-row flex-wrap gap-4 items-end bg-white p-4 rounded-2xl border border-slate-200 shadow-sm shrink-0">
                 <div className="flex flex-col gap-1 w-full sm:w-auto sm:flex-1">
                   <label className="text-[10px] font-bold uppercase text-slate-500">Transaction Type</label>
                   <select value={ledgerFilterType} onChange={e => setLedgerFilterType(e.target.value)} className="w-full px-4 py-2.5 border border-slate-200 rounded-xl font-bold outline-none text-sm bg-slate-50 focus:ring-2 focus:ring-blue-500 appearance-none cursor-pointer">
@@ -996,7 +1206,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                 </div>
               </div>
 
-              <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-x-auto">
+              <div className="directory-table-card directory-table-scroll bg-white border border-slate-200 rounded-2xl shadow-sm overflow-x-auto" tabIndex={0} role="region" aria-label="Stock ledger table">
                 <table className="w-full text-left border-collapse min-w-[1000px]">
                   <thead className="bg-slate-50 border-b border-slate-200">
                     <tr>
@@ -1034,8 +1244,8 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
 
       {/* VIEW: WAREHOUSES */}
           {activeView === 'warehouses' && (
-            <div className="flex flex-col h-full w-full max-w-[1600px] mx-auto animate-in fade-in duration-300 space-y-4 p-4 sm:p-6 min-h-0">
-              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-white p-4 rounded-2xl border border-slate-200 shadow-sm shrink-0">
+            <div className="catalog-warehouses flex flex-col h-full w-full max-w-[1600px] mx-auto animate-in fade-in duration-300 space-y-4 p-4 sm:p-6 min-h-0">
+              <div className="catalog-warehouse-toolbar flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-white p-4 rounded-2xl border border-slate-200 shadow-sm shrink-0">
                  
                  {/* SEARCH BAR MOVED HERE */}
                  <div className="relative w-full sm:w-80 shrink-0">
@@ -1160,7 +1370,9 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
             </div>
             <form onSubmit={handlePlacePoItems} className="flex-1 overflow-y-auto bg-slate-50 flex flex-col p-6 gap-4">
               <div className="bg-sky-50 border border-sky-200 text-sky-800 p-4 rounded-xl text-xs font-bold mb-2">
-                Note: Any items marked as 'Shortage' during receiving have been excluded. Items completely missing from the Master Catalog will be skipped.
+                {placementPo.goodsReceiptId
+                  ? 'Only QC accepted, unplaced goods are listed. Held and rejected quantities remain in quarantine.'
+                  : "Note: Any items marked as 'Shortage' during receiving have been excluded. Items completely missing from the Master Catalog will be skipped."}
               </div>
               {placementPo.items.filter((i: any) => i.confirmedQty && i.confirmedQty > 0).map((item: any) => {
                 const prodExists = products.some(p => p.sku === item.sku || String(p.id) === String(item.productId));
@@ -1169,6 +1381,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                     <div>
                       <div className="text-sm font-black uppercase text-slate-900">{item.productName}</div>
                       <div className="text-[10px] font-bold text-slate-500 mt-1 uppercase tracking-widest">{item.sku}</div>
+                      {placementPo.goodsReceiptId && <div className="text-xs text-slate-500 mt-1">Batch: {item.batchNumber || '—'} · Expiry: {item.expirationDate?.slice(0, 10) || '—'}</div>}
                       {!prodExists && <div className="text-[10px] font-bold text-rose-500 mt-1 uppercase tracking-widest">NOT IN CATALOG - WILL BE SKIPPED</div>}
                     </div>
                     <div className="flex items-center gap-4 w-full sm:w-auto">
@@ -1295,11 +1508,48 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                     />
                   </div>
                 </div>
-
-                <div className="flex flex-col gap-1.5"><label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Name *</label><input required type="text" value={productForm.name} onChange={e=>setProductForm((prev: any) => ({...prev, name: e.target.value}))} className="px-4 py-3 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" /></div>
-                <div className="flex flex-col gap-1.5"><label className="text-xs font-bold uppercase text-slate-500 tracking-wider">SKU *</label><input required type="text" value={productForm.sku} onChange={e=>setProductForm((prev: any) => ({...prev, sku: e.target.value}))} className="px-4 py-3 border border-slate-200 rounded-xl font-bold uppercase outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" /></div>
-                <div className="flex flex-col gap-1.5 md:col-span-2"><label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Cost Price (₱)</label><div className="relative"><span className="absolute left-4 top-3 text-slate-400 font-bold">₱</span><input required type="number" step="0.01" value={productForm.purchasePrice ?? ''} onChange={e=>setProductForm((prev: any) => ({...prev, purchasePrice: e.target.value}))} className="w-full pl-8 pr-4 py-3 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" /></div></div>
+{/* NAME (Full Width) */}
+                <div className="flex flex-col gap-1.5 md:col-span-2"><label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Name *</label><input required type="text" value={productForm.name} onChange={e=>setProductForm((prev: any) => ({...prev, name: e.target.value}))} className="px-4 py-3 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" /></div>
                 
+                {/* SKU */}
+                <div className="flex flex-col gap-1.5"><label className="text-xs font-bold uppercase text-slate-500 tracking-wider">SKU *</label><input required type="text" value={productForm.sku} onChange={e=>setProductForm((prev: any) => ({...prev, sku: e.target.value}))} className="px-4 py-3 border border-slate-200 rounded-xl font-bold uppercase outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" /></div>
+                
+                {/* NEW CMDN INPUT (Auto-formats to Uppercase) */}
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-bold uppercase text-slate-500 tracking-wider">CMDN Number</label>
+                  <input type="text" placeholder="e.g. CMDN-12345" value={productForm.cmdn || ''} onChange={e => setProductForm((prev: any) => ({...prev, cmdn: e.target.value.toUpperCase()}))} className="px-4 py-3 border border-slate-200 rounded-xl font-bold uppercase outline-none focus:ring-2 focus:ring-fuchsia-500 shadow-sm text-fuchsia-900 placeholder:text-slate-300" />
+                </div>
+
+                {/* CATEGORY (With new 'Clear' button) */}
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Category</label>
+                  <div className="flex gap-2">
+                    <input 
+                      type="text" 
+                      list="category-options"
+                      placeholder="e.g. General"
+                      value={productForm.category || ''} 
+                      onChange={e => setProductForm((prev: any) => ({...prev, category: e.target.value}))} 
+                      className="w-full px-4 py-3 border border-slate-200 rounded-xl font-bold uppercase outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" 
+                    />
+                    <button type="button" onClick={() => setProductForm((prev: any) => ({...prev, category: ''}))} className="px-4 bg-slate-100 hover:bg-rose-100 text-slate-500 hover:text-rose-600 rounded-xl font-black uppercase text-[10px] transition-colors shadow-sm border border-slate-200 shrink-0">Clear</button>
+                  </div>
+                  <datalist id="category-options">
+                    <option value="General" />
+                    {uniqueCategories.filter(c => c !== 'General').map(cat => (
+                      <option key={cat} value={cat} />
+                    ))}
+                  </datalist>
+                </div>
+
+                {/* COST PRICE */}
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Cost Price (₱)</label>
+                  <div className="relative">
+                    <span className="absolute left-4 top-3 text-slate-400 font-bold">₱</span>
+                    <input required type="number" step="0.01" value={productForm.purchasePrice ?? ''} onChange={e=>setProductForm((prev: any) => ({...prev, purchasePrice: e.target.value}))} className="w-full pl-8 pr-4 py-3 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" />
+                  </div>
+                </div>
                 {/* DYNAMIC CATEGORY PRICING UI */}
                 {customerCategories.length > 0 && (
                   <div className="md:col-span-2 mt-2">
@@ -1367,7 +1617,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
               try {
                 const url = editingWarehouseId ? `${API_BASE_URL}/warehouses/${editingWarehouseId}` : `${API_BASE_URL}/warehouses`;
                 const method = editingWarehouseId ? 'PATCH' : 'POST';
-                const response = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...warehouseForm, company: selectedCompany }) });
+                const response = await fetch(url, { method, headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ ...warehouseForm, company: selectedCompany }) });
                 if (response.ok) {
                   showToast(`Warehouse ${editingWarehouseId ? 'updated' : 'registered'}.`, "success");
                   setWarehouseForm({ name: '', address: '', status: 'Active' });
@@ -1520,8 +1770,8 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                     currentMasterStock = adjQ;
                     if(pIdx > -1) nextProducts[pIdx].currentStock = currentMasterStock;
 
-                    apiPromises.push(fetch(`${API_BASE_URL}/products/${prod.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ currentStock: currentMasterStock }) }));
-                    apiPromises.push(fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: 'ADJUST', quantity: delta, previousStock: prod.currentStock, newStock: currentMasterStock, reference: txForm.reference, remarks: txForm.remarks, user: loginUsername, company: selectedCompany, warehouseId: null }) }));
+                    apiPromises.push(fetch(`${API_BASE_URL}/products/${prod.id}`, { method: 'PATCH', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ currentStock: currentMasterStock }) }));
+                    apiPromises.push(fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: 'ADJUST', quantity: delta, previousStock: prod.currentStock, newStock: currentMasterStock, reference: txForm.reference, remarks: txForm.remarks, user: loginUsername, company: selectedCompany, warehouseId: null }) }));
                     continue;
                   }
 
@@ -1545,7 +1795,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                     if (sourceStock < q) throw new Error(`Not enough stock of ${prod.sku} in Source Location.`);
                     const sIdx = nextHubStock.findIndex(h => String(h.warehouseId) === String(source) && Number(h.productId) === Number(prod.id));
                     if(sIdx > -1) nextHubStock[sIdx].quantity -= q;
-                    apiPromises.push(fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: source, productId: prod.id, sku: prod.sku, quantity: -q }) }));
+                    apiPromises.push(fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: source, productId: prod.id, sku: prod.sku, quantity: -q }) }));
                   }
 
                   // 2. ADD TO DESTINATION
@@ -1555,17 +1805,17 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                     const dIdx = nextHubStock.findIndex(h => String(h.warehouseId) === String(dest) && Number(h.productId) === Number(prod.id));
                     if(dIdx > -1) nextHubStock[dIdx].quantity += q;
                     else nextHubStock.push({ id: 'temp', warehouseId: dest, productId: prod.id, sku: prod.sku, quantity: q });
-                    apiPromises.push(fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: dest, productId: prod.id, sku: prod.sku, quantity: q }) }));
+                    apiPromises.push(fetch(`${API_BASE_URL}/warehouse-stock`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ company: selectedCompany, warehouseId: dest, productId: prod.id, sku: prod.sku, quantity: q }) }));
                   }
 
                   // 3. LOG MOVEMENT
                   const logWarehouseId = (dest !== 'MASTER' && dest !== 'EXTERNAL') ? dest : ((source !== 'MASTER' && source !== 'EXTERNAL') ? source : null);
-                  apiPromises.push(fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: txModal.type, quantity: q, previousStock: prevMasterForLog, newStock: currentMasterStock, reference: txForm.reference, remarks: txForm.remarks, user: loginUsername, company: selectedCompany, warehouseId: logWarehouseId, batchNumber: txForm.batchNumber, expirationDate: txForm.expirationDate }) }));
+                  apiPromises.push(fetch(`${API_BASE_URL}/inventory-movements`, { method: 'POST', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ productId: prod.id, productName: prod.name, sku: prod.sku, type: txModal.type, quantity: q, previousStock: prevMasterForLog, newStock: currentMasterStock, reference: txForm.reference, remarks: txForm.remarks, user: loginUsername, company: selectedCompany, warehouseId: logWarehouseId, batchNumber: txForm.batchNumber, expirationDate: txForm.expirationDate }) }));
 
                   // 4. MASTER STOCK PATCH
                   if (currentMasterStock !== (Number(prod.currentStock) || 0)) {
                     if(pIdx > -1) nextProducts[pIdx].currentStock = currentMasterStock;
-                    apiPromises.push(fetch(`${API_BASE_URL}/products/${prod.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ currentStock: currentMasterStock }) }));
+                    apiPromises.push(fetch(`${API_BASE_URL}/products/${prod.id}`, { method: 'PATCH', headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' }, body: JSON.stringify({ currentStock: currentMasterStock }) }));
                   }
                 }
 

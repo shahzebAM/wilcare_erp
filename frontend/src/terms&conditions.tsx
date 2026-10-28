@@ -6,7 +6,7 @@ export default function Terms() {
 
       <h2 style={{ marginTop: '30px' }}>1. Acceptance of Terms</h2>
       <p>
-        By accessing and using the Olten Enterprise Resource Planning (ERP) application ("the App"), you accept and agree to be bound by the terms and provision of this agreement. The App is intended strictly for authorized internal corporate use by approved personnel only.
+        By accessing and using the Wilcare Enterprise Resource Planning (ERP) application ("the App"), you accept and agree to be bound by the terms and provision of this agreement. The App is intended strictly for authorized internal corporate use by approved personnel only.
       </p>
 
       <h2 style={{ marginTop: '30px' }}>2. User Accounts and Security</h2>

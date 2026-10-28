@@ -1,4 +1,4 @@
-const PRODUCTION_API_URL = 'https://olten-production.up.railway.app';
+const PRODUCTION_API_URL = 'https://wilcareerp-production.up.railway.app';
 
 export function resolveApiConfig(configuredUrl: string | undefined, development: boolean) {
   const fallback = development ? 'http://localhost:3000' : PRODUCTION_API_URL;
