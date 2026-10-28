@@ -1,7 +1,7 @@
+import '../environment';
 import { Injectable, Logger } from '@nestjs/common';
 import { GoogleGenAI, MediaResolution, ThinkingLevel, Type } from '@google/genai';
 import type { File as GeminiFile, GenerateContentConfig, Part } from '@google/genai';
-import * as dotenv from 'dotenv';
 import * as mammoth from 'mammoth';
 import JSZip from 'jszip';
 import { DOMParser } from '@xmldom/xmldom';
@@ -12,8 +12,6 @@ import type { ExtractedExpiry } from './expiry-extractor.service';
 import { ExpiryExtractorService } from './expiry-extractor.service';
 import { parseIsoDate } from './expiry-date.utils';
 import { readPdfExpiryText } from './pdf-expiry-text';
-
-dotenv.config();
 
 export interface IndexedGeminiFile {
   fileUri: string;

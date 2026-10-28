@@ -1,10 +1,8 @@
+import '../environment';
 import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import { google } from 'googleapis';
 import { Readable } from 'stream';
 import { createHash } from 'crypto';
-import * as dotenv from 'dotenv';
-
-dotenv.config();
 
 export interface DriveFileContent {
   stream: Readable;

@@ -25,6 +25,14 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+## Environment file
+
+Local startup loads `backend/.env` relative to this backend's source or compiled
+files, even when the command is launched from another folder. Drive and Gemini
+use that same loader. Existing process variables, including Railway service
+variables and explicitly configured test databases, take precedence. Environment
+file contents are not copied or changed by this loader.
+
 ## Project setup
 
 ```bash

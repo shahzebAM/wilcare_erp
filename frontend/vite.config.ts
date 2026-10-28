@@ -4,6 +4,9 @@ import tailwindcss from '@tailwindcss/vite'
 import { readFile, readdir } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { dirname, extname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const frontendDirectory = dirname(fileURLToPath(import.meta.url))
 
 // Keep PDF decoding resources on this origin, including development servers
 // whose test/project root differs from the directory containing this config.
@@ -64,6 +67,8 @@ function localPdfAssets(): Plugin {
 }
 
 export default defineConfig({
+  root: frontendDirectory,
+  envDir: frontendDirectory,
   plugins: [react(),
     tailwindcss(),
     localPdfAssets(),
