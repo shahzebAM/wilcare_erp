@@ -154,7 +154,7 @@ const EmployeeFormFields = ({ formData, handleChange }: any) => (
     </div>
 
     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6 mt-4 sm:mt-6">
-      <InputField required type="date" label="Birth Date" value={formData.dateOfBirth} onChange={handleChange('dateOfBirth', 'standard')} />
+     <InputField required type="text" placeholder="MM/DD/YYYY" label="Birth Date" value={formData.dateOfBirth} onChange={handleChange('dateOfBirth', 'birthdate')} />
       <div className="flex flex-col gap-1.5 w-full">
         <label className="text-sm font-medium text-slate-600">Civil Status <span className="text-blue-600">*</span></label>
         <div className="relative">
@@ -895,7 +895,7 @@ const toCents = (val: any): number => {
     reader.readAsText(file);
   };
 
- const handleFormattedChange = (field: string, type: 'tin' | 'sss' | 'philhealth' | 'pagibig' | 'bank' | 'birthdate' | 'standard') => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+const handleFormattedChange = (field: string, type: 'tin' | 'sss' | 'philhealth' | 'pagibig' | 'bank' | 'birthdate' | 'standard') => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     let val = e.target.value;
     if (type !== 'standard') {
       let digits = val.replace(/\D/g, ''); 
@@ -937,7 +937,7 @@ const toCents = (val: any): number => {
       }
     }
     setFormData(prev => ({ ...prev, [field]: val }));
-  };   
+  };
 
   const handleSubmitEmployee = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1008,7 +1008,7 @@ const toCents = (val: any): number => {
     setFormData({
       employeeId: emp.employeeId || '', 
       firstName: emp.firstName, middleName: emp.middleName || '', lastName: emp.lastName,
-     dateOfBirth: emp.dateOfBirth ? formatMDY(emp.dateOfBirth.split('T')[0]) : '', civilStatus: emp.civilStatus,
+   dateOfBirth: emp.dateOfBirth ? formatMDY(emp.dateOfBirth.split('T')[0]) : '', civilStatus: emp.civilStatus,
       address: emp.address, employmentStatus: emp.employmentStatus, baseRate: emp.baseRate.toString(),
       bankAccount: emp.bankAccount || '', tin: emp.tin || '', sssNumber: emp.sssNumber || '',
       philhealth: emp.philhealth || '', pagIbig: emp.pagIbig || '',

@@ -306,10 +306,27 @@ export default function AttendanceEntryGrid({ selectedCompany, API_BASE_URL, emp
                   </span>
                 </td>
                 {(['timeIn', 'timeOut'] as const).map(field => <td key={field} className="w-44 px-3.5 py-2">{row.kind !== 'work' ? <span className="inline-block rounded-md bg-amber-100 px-2.5 py-1 text-xs font-bold text-amber-800">{field === 'timeIn' ? 'Leave' : row.kind === 'paid' ? 'Paid' : 'Unpaid'}</span> : <div className="flex items-center gap-1.5">
-                  <input aria-label={`${label} ${field === 'timeIn' ? 'Time In' : 'Time Out'}`} aria-invalid={!!row.error} data-time-field={field} value={row[field]} placeholder="h:mm AM/PM" disabled={readOnly} className={`${fieldClass} w-32 font-mono text-[13px] font-bold text-slate-900 border-slate-300 shadow-sm`}
-                    onChange={event => updateRow(row.key, { [field]: event.target.value })}
+                 <input aria-label={`${label} ${field === 'timeIn' ? 'Time In' : 'Time Out'}`} aria-invalid={!!row.error} data-time-field={field} value={row[field]} placeholder="h:mm AM/PM" disabled={readOnly} className={`${fieldClass} w-32 font-mono text-[13px] font-bold text-slate-900 border-slate-300 shadow-sm`}
+                    onChange={event => {
+                      const raw = event.target.value;
+                      // As soon as user finishes typing "am" or "pm" (e.g. "820am"), auto-format immediately to "8:20 AM"
+                      if (/(?:am|pm)\s*$/i.test(raw) && normalizeEntryTime(raw)) {
+                        updateRow(row.key, { [field]: displayEntryTime(raw) });
+                      } else {
+                        updateRow(row.key, { [field]: raw });
+                      }
+                    }}
                     onBlur={event => { if (normalizeEntryTime(event.target.value)) updateRow(row.key, { [field]: displayEntryTime(event.target.value) }); }}
-                    onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); const inputs = [...(tableRef.current?.querySelectorAll<HTMLInputElement>(`input[data-time-field="${field}"]:not(:disabled)`) ?? [])]; inputs[inputs.indexOf(event.currentTarget) + 1]?.focus(); } }} />
+                    onKeyDown={event => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        if (normalizeEntryTime(event.currentTarget.value)) {
+                          updateRow(row.key, { [field]: displayEntryTime(event.currentTarget.value) });
+                        }
+                        const inputs = [...(tableRef.current?.querySelectorAll<HTMLInputElement>(`input[data-time-field="${field}"]:not(:disabled)`) ?? [])];
+                        inputs[inputs.indexOf(event.currentTarget) + 1]?.focus();
+                      }
+                    }} />
                   <label className="relative cursor-pointer rounded-md border border-indigo-200 bg-indigo-50/70 p-1.5 text-indigo-600 hover:bg-indigo-100" title="Choose time">◷<input type="time" aria-label={`${label} choose ${field === 'timeIn' ? 'Time In' : 'Time Out'}`} tabIndex={-1} value={normalizeEntryTime(row[field]) ?? ''} disabled={readOnly} onChange={event => updateRow(row.key, { [field]: displayEntryTime(event.target.value) })} className="absolute inset-0 w-full cursor-pointer opacity-0" /></label>
                 </div>}{field === 'timeOut' && overnight && <span className="mt-1 inline-block rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-bold text-indigo-700">Ends next day</span>}</td>)}
                 <td className="px-3.5 py-2.5 font-mono text-xs font-bold">
