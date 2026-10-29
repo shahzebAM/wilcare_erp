@@ -78,11 +78,28 @@ const MINUTES_PER_DAY = 1440;
 
 export const parseTimeToMinutes = (timeStr?: string | null): number | null => {
   if (!timeStr || typeof timeStr !== 'string') return null;
-  const match = timeStr.trim().match(/^(\d{1,2}):(\d{2})(?:\s*(AM|PM))?$/i);
-  if (!match) return null;
-  let hours = Number(match[1]);
-  const minutes = Number(match[2]);
-  const period = match[3]?.toUpperCase();
+  const clean = timeStr.trim();
+  let match = clean.match(/^(\d{1,2}):(\d{2})(?:\s*(AM|PM|A|P))?$/i);
+  if (!match) {
+    match = clean.match(/^(\d{1,2})(\d{2})(?:\s*(AM|PM|A|P))?$/i);
+  }
+  let hours: number;
+  let minutes: number;
+  let rawPeriod: string | undefined;
+
+  if (match) {
+    hours = Number(match[1]);
+    minutes = Number(match[2]);
+    rawPeriod = match[3]?.toUpperCase();
+  } else {
+    const hourOnly = clean.match(/^(\d{1,2})\s*(AM|PM)$/i);
+    if (!hourOnly) return null;
+    hours = Number(hourOnly[1]);
+    minutes = 0;
+    rawPeriod = hourOnly[2]?.toUpperCase();
+  }
+
+  const period = rawPeriod ? (rawPeriod.startsWith('A') ? 'AM' : 'PM') : undefined;
   if (minutes > 59 || (period ? hours < 1 || hours > 12 : hours > 23))
     return null;
   if (period === 'AM' && hours === 12) hours = 0;
