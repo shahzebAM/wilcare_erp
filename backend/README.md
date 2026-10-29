@@ -67,6 +67,22 @@ $ npm run test:cov
 
 ## Deployment
 
+### Wilcare Railway pipeline
+
+The existing `wilcare_erp` production service deploys from
+`shahzebAM/wilcare_erp`, branch `main`, with root directory `/backend`. Keep its
+build command as `npm run build` and start command as `npm run start:prod`.
+After committing backend changes, `git push origin main` triggers the pipeline;
+check that the successful Railway deployment shows the pushed commit hash.
+The Railway GitHub App must retain access to this repository.
+
+Production reads the Wilcare backend service variables in Railway. Local
+`.env` files remain local and are not committed or copied from Olten. A code
+push does not itself upgrade PostgreSQL: the existing Wilcare database upgrade
+is documented in `manual-sql/wilcare-legacy-upgrade-20261029.md`. Do not add a
+pre-deploy command that replays the historical Prisma migrations against this
+already-upgraded database.
+
 When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
 
 If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
