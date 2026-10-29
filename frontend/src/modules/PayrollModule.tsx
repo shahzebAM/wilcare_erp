@@ -895,7 +895,7 @@ const toCents = (val: any): number => {
     reader.readAsText(file);
   };
 
-  const handleFormattedChange = (field: string, type: 'tin' | 'sss' | 'philhealth' | 'pagibig' | 'bank' | 'standard') => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+ const handleFormattedChange = (field: string, type: 'tin' | 'sss' | 'philhealth' | 'pagibig' | 'bank' | 'birthdate' | 'standard') => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     let val = e.target.value;
     if (type !== 'standard') {
       let digits = val.replace(/\D/g, ''); 
@@ -911,7 +911,30 @@ const toCents = (val: any): number => {
         digits = digits.slice(0, 12); 
         const m = digits.match(/^(\d{0,4})(\d{0,4})(\d{0,4})$/);
         val = m ? `${m[1]}${m[2] ? '-' + m[2] : ''}${m[3] ? '-' + m[3] : ''}` : digits;
-      } else if (type === 'bank') { digits = digits.slice(0, 20); val = digits; }
+      } else if (type === 'bank') {
+        digits = digits.slice(0, 20);
+        val = digits;
+      } else if (type === 'birthdate') {
+        digits = digits.slice(0, 8);
+        if (digits.length === 8) {
+          val = `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4, 8)}`;
+        } else if (digits.length === 7 && (digits.slice(3).startsWith('19') || digits.slice(3).startsWith('20'))) {
+          const md = digits.slice(0, 3);
+          const yyyy = digits.slice(3);
+          const firstTwo = parseInt(md.slice(0, 2), 10);
+          if (firstTwo >= 10 && firstTwo <= 12 && parseInt(md[2], 10) >= 1) {
+            val = `${md.slice(0, 2)}/0${md[2]}/${yyyy}`;
+          } else {
+            val = `0${md[0]}/${md.slice(1, 3)}/${yyyy}`;
+          }
+        } else if (digits.length > 4) {
+          val = `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4)}`;
+        } else if (digits.length > 2) {
+          val = `${digits.slice(0, 2)}/${digits.slice(2)}`;
+        } else {
+          val = digits;
+        }
+      }
     }
     setFormData(prev => ({ ...prev, [field]: val }));
   };   
@@ -985,7 +1008,7 @@ const toCents = (val: any): number => {
     setFormData({
       employeeId: emp.employeeId || '', 
       firstName: emp.firstName, middleName: emp.middleName || '', lastName: emp.lastName,
-      dateOfBirth: emp.dateOfBirth ? emp.dateOfBirth.split('T')[0] : '', civilStatus: emp.civilStatus,
+     dateOfBirth: emp.dateOfBirth ? formatMDY(emp.dateOfBirth.split('T')[0]) : '', civilStatus: emp.civilStatus,
       address: emp.address, employmentStatus: emp.employmentStatus, baseRate: emp.baseRate.toString(),
       bankAccount: emp.bankAccount || '', tin: emp.tin || '', sssNumber: emp.sssNumber || '',
       philhealth: emp.philhealth || '', pagIbig: emp.pagIbig || '',
@@ -1278,7 +1301,7 @@ const toCents = (val: any): number => {
   <h2 className="hidden print:block text-center text-xl font-black uppercase mb-6 tracking-widest text-slate-900">
     {selectedCompany} TRADING CORP.
   </h2>
-                {(() => {
+              {(() => {
                   const rec = selectedPayslip.record;
                   const emp = selectedPayslip.emp;
                   const breakdown = getSavedPayslipBreakdown(rec, emp.baseRate);
@@ -1286,8 +1309,24 @@ const toCents = (val: any): number => {
                   const manualAdjustment = breakdown.adjustment;
                   const payslipMoney = (value: number | null) => value === null ? 'Not recorded' : formatMoney(value);
                   const payslipHours = (value: number | null) => value === null ? 'Not recorded' : formatDecToHM(value);
+
+                  // Separate Work on Sunday from Regular Pay for payslip display while keeping Total Earnings identical
+                  const cStart = rec.attendanceSummary?.cutoffStart || payrollStartDate;
+                  const cEnd = rec.attendanceSummary?.cutoffEnd || payrollEndDate;
+                  const cutoffSummary = getAttendanceSummary(emp.id, cStart, cEnd);
+                  const sundayRegularMinutes = cutoffSummary.days
+                    .filter(d => new Date(`${d.date}T00:00:00Z`).getUTCDay() === 0)
+                    .reduce((sum, d) => sum + d.metrics.regularMinutes, 0);
+                  const sundayHours = sundayRegularMinutes / 60;
+                  const sundayPay = breakdown.ratePerHour !== null && sundayRegularMinutes > 0
+                    ? fromCents(Math.round((sundayRegularMinutes / 60) * breakdown.ratePerHour * 100))
+                    : 0;
+                  const separatedRegularPay = breakdown.regularPay !== null
+                    ? fromCents(Math.max(0, toCents(breakdown.regularPay) - toCents(sundayPay)))
+                    : null;
+
                   const totalEarnings = rec.grossPay; 
-                 const totalDeductionsCalc = calculateTotalPayrollDeductions(rec);
+                  const totalDeductionsCalc = calculateTotalPayrollDeductions(rec);
 
                   return (
                     <table className="w-full text-left border-collapse border border-slate-300 text-[11px] sm:text-xs text-slate-700 bg-white shadow-sm print:shadow-none">
@@ -1302,7 +1341,7 @@ const toCents = (val: any): number => {
                         <tr><td colSpan={2} className="border border-slate-300 px-3 py-1 font-medium">RATE PER DAY</td><td className="border border-slate-300"></td><td colSpan={2} className="border border-slate-300 px-3 text-right font-mono text-slate-700">{payslipMoney(breakdown.ratePerDay)}</td></tr>
                         <tr><td colSpan={2} className="border border-slate-300 px-3 py-1 font-medium">TOTAL HOURS</td><td className="border border-slate-300"></td><td colSpan={2} className="border border-slate-300 px-3 text-right font-mono text-slate-700">{payslipHours(breakdown.totalHours)}</td></tr>
                         <tr><td colSpan={2} className="border border-slate-300 px-3 py-1 font-medium">REQUIRED NO.OF HOURS</td><td className="border border-slate-300"></td><td colSpan={2} className="border border-slate-300 px-3 text-right font-mono text-slate-700">{payslipHours(breakdown.requiredHours)}</td></tr>
-                        <tr><td colSpan={2} className="border border-slate-300 px-3 py-1 font-bold text-slate-800">REGULAR PAY</td><td className="border border-slate-300"></td><td colSpan={2} className="border border-slate-300 px-3 text-right bg-indigo-50 font-mono font-bold text-indigo-900">{payslipMoney(breakdown.regularPay)}</td></tr>
+                        <tr><td colSpan={2} className="border border-slate-300 px-3 py-1 font-bold text-slate-800">REGULAR PAY</td><td className="border border-slate-300"></td><td colSpan={2} className="border border-slate-300 px-3 text-right bg-indigo-50 font-mono font-bold text-indigo-900">{payslipMoney(separatedRegularPay)}</td></tr>
                         <tr><td colSpan={2} className="border border-slate-300 px-3 py-1 font-medium">OT HOURS{legacy ? ' (CUTOFF BALANCE)' : ''}</td><td className="border border-slate-300"></td><td colSpan={2} className="border border-slate-300 px-3 text-right font-mono text-slate-700">{payslipHours(breakdown.overtimeHours)}</td></tr>
                         <tr><td colSpan={2} className="border border-slate-300 px-3 py-1 font-medium">RATE FOR OT</td><td className="border border-slate-300"></td><td colSpan={2} className="border border-slate-300 px-3 text-right font-mono text-slate-700">{payslipMoney(breakdown.ratePerHour === null ? null : breakdown.ratePerHour * 1.25)}</td></tr>
                         <tr><td colSpan={2} className="border border-slate-300 px-3 py-1 font-bold text-slate-800">OT PAY</td><td className="border border-slate-300"></td><td colSpan={2} className="border border-slate-300 px-3 text-right bg-indigo-50 font-mono font-bold text-indigo-900">{payslipMoney(breakdown.otPay)}</td></tr>
@@ -1311,7 +1350,7 @@ const toCents = (val: any): number => {
                         ) : (
                            <tr><td colSpan={2} className="border border-slate-300 px-3 py-1 font-medium">{legacy ? 'BALANCING ADJ' : 'HOLIDAY'}</td><td className="border border-slate-300"></td><td colSpan={2} className="border border-slate-300 px-3 text-right font-mono text-slate-700">{payslipMoney(manualAdjustment)}</td></tr>
                         )}
-                        <tr><td colSpan={2} className="border border-slate-300 px-3 py-1 font-medium">SUNDAY</td><td className="border border-slate-300"></td><td colSpan={2} className="border border-slate-300 px-3 text-right font-mono text-slate-700">-</td></tr>
+                        <tr><td colSpan={2} className="border border-slate-300 px-3 py-1 font-bold text-slate-800">SUNDAY{sundayHours > 0 ? ` (${formatDecToHM(sundayHours)})` : ''}</td><td className="border border-slate-300"></td><td colSpan={2} className={`border border-slate-300 px-3 text-right font-mono ${sundayPay > 0 ? 'bg-amber-50 font-bold text-amber-900' : 'text-slate-700'}`}>{sundayPay > 0 ? formatMoney(sundayPay) : '-'}</td></tr>
                         <tr><td colSpan={5} className="border border-slate-300 bg-white border-t-0"></td><td colSpan={2} className="border border-slate-300 px-3 py-1.5 text-right font-bold text-slate-800 bg-slate-50 uppercase text-[10px] tracking-wider border-l-0">Total Earnings:</td><td colSpan={2} className="border border-slate-300 px-3 text-right font-mono font-bold text-emerald-700 bg-emerald-50 border-b-2 border-slate-400 text-sm">{formatMoney(totalEarnings)}</td></tr>
                       {(() => {
                           const activeDeductions = [

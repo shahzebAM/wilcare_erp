@@ -100,7 +100,42 @@ export default function AttendanceEntryGrid({ selectedCompany, API_BASE_URL, emp
     }
     setQuery(''); setPickerOpen(false);
   };
-  const updateRow = (key: string, update: Partial<EntryRow>) => setRows(current => current.map(row => row.key === key ? { ...row, ...update, error: undefined } : row));
+ const updateRow = (key: string, update: Partial<EntryRow>) => setRows(current => current.map(row => row.key === key ? { ...row, ...update, error: undefined } : row));
+
+  const removeSession = async (row: EntryRow, dateSessionCount: number) => {
+    if (saveLock.current || disabled) return;
+    // If it is an unsaved session row added by mistake
+    if (!row.source) {
+      if (dateSessionCount > 1) {
+        setRows(current => current.filter(item => item.key !== row.key));
+      } else {
+        updateRow(row.key, { kind: 'work', timeIn: '', timeOut: '', reason: '', error: undefined });
+      }
+      return;
+    }
+    // If it is a saved session in the database
+    if (!window.confirm(`Remove saved session (${row.timeIn || 'Leave'} - ${row.timeOut || ''}) on ${dateLabel(row.date)}?`)) return;
+    saveLock.current = true;
+    setLoading(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/employees/attendance/${row.source.id}`, {
+        method: 'DELETE',
+        headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany },
+      });
+      if (!response.ok) throw new Error(`Could not remove session (${response.status}).`);
+      const fresh = await readRecords();
+      setRecords(fresh);
+      onRecordsChange(fresh);
+      setOfficialCurrent(true);
+      setRows(current => mergeRows(fresh, dates, employee!.id, current.filter(item => item.key !== row.key)));
+      setMessage('Attendance session removed.');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Failed to remove session.');
+    } finally {
+      saveLock.current = false;
+      setLoading(false);
+    }
+  };
   const refresh = async (reset = false) => {
     if (!employee || saveLock.current || (reset && dirty && !window.confirm('Reset unsaved changes and reload saved attendance? This does not delete records.'))) return;
     saveLock.current = true; setLoading(true);
@@ -239,35 +274,63 @@ export default function AttendanceEntryGrid({ selectedCompany, API_BASE_URL, emp
       {message && <p role="status" className="border-b border-indigo-100 bg-indigo-50 px-4 py-2 text-sm text-indigo-900">{message}</p>}
       {loadError && <p role="alert" className="px-4 py-3 text-sm text-rose-700">{loadError}</p>}
       {!employee ? <p className="p-8 text-center text-sm text-slate-500">Select an employee to enter attendance.</p> : !ready ? <p className="p-8 text-center text-sm text-slate-500">{loadError ? 'Use Refresh to retry loading attendance.' : 'Loading saved attendance…'}</p> : <>
-        <div className="max-h-[62vh] overflow-auto">
-          <table ref={tableRef} className="w-full min-w-[920px] border-collapse text-left text-sm" aria-label="Attendance cutoff entries">
-            <thead className="sticky top-0 z-10 bg-slate-100 text-xs text-slate-600"><tr>{['Date', 'Day', 'Time In', 'Time Out', 'Regular Hours', 'Overtime', 'Action'].map(label => <th key={label} scope="col" className="border-b border-slate-300 px-3 py-2.5 font-semibold">{label}</th>)}</tr></thead>
+      <div className="max-h-[62vh] overflow-auto">
+          <table ref={tableRef} className="w-full min-w-[960px] border-collapse text-left text-[13px]" aria-label="Attendance cutoff entries">
+            <thead className="sticky top-0 z-10 bg-indigo-950 text-xs uppercase tracking-wider text-white shadow-sm">
+              <tr>{['Date', 'Day', 'Time In', 'Time Out', 'Regular Hours', 'Overtime', 'Action'].map(label => <th key={label} scope="col" className="border-b border-indigo-900 px-3.5 py-3 font-bold">{label}</th>)}</tr>
+            </thead>
             <tbody>{rows.map((row, index) => {
               const changed = isChanged(row);
               const pending = changed || (!!row.source && !officialCurrent);
-              const label = `${row.date} session ${rows.slice(0, index + 1).filter(item => item.date === row.date).length}`;
+              const dateSessionCount = rows.filter(item => item.date === row.date).length;
+              const sessionNumber = rows.slice(0, index + 1).filter(item => item.date === row.date).length;
+              const label = `${row.date} session ${sessionNumber}`;
               const firstOnDate = index === 0 || rows[index - 1].date !== row.date;
+              const dayName = dateLabel(row.date, true);
+              const isSunday = dayName === 'Sun';
               const overnight = row.kind === 'work' && normalizeEntryTime(row.timeIn) && normalizeEntryTime(row.timeOut) && normalizeEntryTime(row.timeOut)! < normalizeEntryTime(row.timeIn)!;
               const readOnly = disabled || !!row.unconfirmed;
-              return <tr key={row.key} data-entry-date={row.date} data-record-id={row.source?.id} className={`border-b border-slate-200 ${row.error ? 'bg-rose-50' : changed ? 'bg-amber-50/70' : 'hover:bg-slate-50'} ${firstOnDate ? 'border-t' : ''}`}>
-                <th scope="row" className="px-3 py-2 font-medium text-slate-700"><span>{dateLabel(row.date)}</span><span className="mt-0.5 block text-[10px] font-normal text-slate-400">{row.source ? `#${row.source.id}` : changed ? 'Unsaved' : 'Blank'}</span></th>
-                <td className="px-3 py-2 text-xs text-slate-500">{dateLabel(row.date, true)}</td>
-                {(['timeIn', 'timeOut'] as const).map(field => <td key={field} className="w-40 px-3 py-1.5">{row.kind !== 'work' ? <span className="text-xs text-slate-500">{field === 'timeIn' ? 'Leave' : row.kind === 'paid' ? 'Paid' : 'Unpaid'}</span> : <div className="flex items-center gap-1">
-                  <input aria-label={`${label} ${field === 'timeIn' ? 'Time In' : 'Time Out'}`} aria-invalid={!!row.error} data-time-field={field} value={row[field]} placeholder="h:mm AM/PM" disabled={readOnly} className={`${fieldClass} w-28 font-mono text-xs`}
+              const canRemove = dateSessionCount > 1 || !!row.source || changed;
+              const otMins = row.source?.metrics?.otMinutes ?? 0;
+
+              return <tr key={row.key} data-entry-date={row.date} data-record-id={row.source?.id} className={`border-b border-slate-200 transition-colors ${row.error ? 'bg-rose-50/90' : changed ? 'bg-amber-50/80' : isSunday ? 'bg-rose-50/25 hover:bg-rose-50/50' : 'hover:bg-indigo-50/40'} ${firstOnDate ? 'border-t border-slate-300' : 'bg-slate-50/40'}`}>
+                <th scope="row" className="px-3.5 py-2.5 font-bold text-slate-800">
+                  <span className="text-sm">{dateLabel(row.date)}</span>
+                  <span className={`mt-0.5 block text-[11px] font-semibold ${row.source ? 'text-indigo-600' : changed ? 'text-amber-600' : 'text-slate-400'}`}>
+                    {row.source ? `#${row.source.id}` : changed ? 'Unsaved' : 'Blank'}{dateSessionCount > 1 ? ` · S${sessionNumber}` : ''}
+                  </span>
+                </th>
+                <td className="px-3.5 py-2.5">
+                  <span className={`inline-block rounded-md px-2 py-0.5 text-xs font-bold ${isSunday ? 'border border-rose-200 bg-rose-100 text-rose-700' : 'bg-slate-100 text-slate-700'}`}>
+                    {dayName}
+                  </span>
+                </td>
+                {(['timeIn', 'timeOut'] as const).map(field => <td key={field} className="w-44 px-3.5 py-2">{row.kind !== 'work' ? <span className="inline-block rounded-md bg-amber-100 px-2.5 py-1 text-xs font-bold text-amber-800">{field === 'timeIn' ? 'Leave' : row.kind === 'paid' ? 'Paid' : 'Unpaid'}</span> : <div className="flex items-center gap-1.5">
+                  <input aria-label={`${label} ${field === 'timeIn' ? 'Time In' : 'Time Out'}`} aria-invalid={!!row.error} data-time-field={field} value={row[field]} placeholder="h:mm AM/PM" disabled={readOnly} className={`${fieldClass} w-32 font-mono text-[13px] font-bold text-slate-900 border-slate-300 shadow-sm`}
                     onChange={event => updateRow(row.key, { [field]: event.target.value })}
                     onBlur={event => { if (normalizeEntryTime(event.target.value)) updateRow(row.key, { [field]: displayEntryTime(event.target.value) }); }}
                     onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); const inputs = [...(tableRef.current?.querySelectorAll<HTMLInputElement>(`input[data-time-field="${field}"]:not(:disabled)`) ?? [])]; inputs[inputs.indexOf(event.currentTarget) + 1]?.focus(); } }} />
-                  <label className="relative cursor-pointer rounded border border-slate-200 bg-white p-1 text-slate-400" title="Choose time">◷<input type="time" aria-label={`${label} choose ${field === 'timeIn' ? 'Time In' : 'Time Out'}`} tabIndex={-1} value={normalizeEntryTime(row[field]) ?? ''} disabled={readOnly} onChange={event => updateRow(row.key, { [field]: displayEntryTime(event.target.value) })} className="absolute inset-0 w-full cursor-pointer opacity-0" /></label>
-                </div>}{field === 'timeOut' && overnight && <span className="text-[10px] text-indigo-600">Ends next day</span>}</td>)}
-                <td className="px-3 py-2 font-mono text-xs text-indigo-700">{pending ? 'Pending' : row.source ? row.source.metrics ? hoursLabel(row.source.metrics.regularMinutes) : 'Unavailable' : '—'}</td>
-                <td className="px-3 py-2 font-mono text-xs text-purple-700">{pending ? 'Pending' : row.source ? row.source.metrics ? hoursLabel(row.source.metrics.otMinutes) : 'Unavailable' : '—'}</td>
-                <td className="min-w-56 px-3 py-1.5">
-                  <div className="flex flex-wrap items-center gap-2"><select aria-label={`${label} entry type`} value={row.kind} disabled={readOnly} onChange={event => updateRow(row.key, { kind: event.target.value as EntryKind, timeIn: '', timeOut: '' })} className={`${fieldClass} py-1 text-xs`}><option value="work">Work</option><option value="paid">Paid leave</option><option value="unpaid">Unpaid leave</option></select>
-                    {firstOnDate && <button type="button" disabled={disabled} onClick={() => setRows(current => { const added: EntryRow = { key: `new-${++nextKey.current}`, date: row.date, kind: 'work', timeIn: '', timeOut: '', reason: '' }; const last = current.findLastIndex(item => item.date === row.date); return [...current.slice(0, last + 1), added, ...current.slice(last + 1)]; })} className="text-xs font-semibold text-indigo-600 disabled:opacity-50" aria-label={`Add Session ${row.date}`}>+ Add Session</button>}
-                    {changed && <span className="text-[10px] font-semibold text-amber-700">{row.unconfirmed ? 'Check status' : 'Unsaved'}</span>}
+                  <label className="relative cursor-pointer rounded-md border border-indigo-200 bg-indigo-50/70 p-1.5 text-indigo-600 hover:bg-indigo-100" title="Choose time">◷<input type="time" aria-label={`${label} choose ${field === 'timeIn' ? 'Time In' : 'Time Out'}`} tabIndex={-1} value={normalizeEntryTime(row[field]) ?? ''} disabled={readOnly} onChange={event => updateRow(row.key, { [field]: displayEntryTime(event.target.value) })} className="absolute inset-0 w-full cursor-pointer opacity-0" /></label>
+                </div>}{field === 'timeOut' && overnight && <span className="mt-1 inline-block rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-bold text-indigo-700">Ends next day</span>}</td>)}
+                <td className="px-3.5 py-2.5 font-mono text-xs font-bold">
+                  {pending ? <span className="text-amber-600">Pending</span> : row.source ? row.source.metrics ? <span className="inline-block rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-emerald-800">{hoursLabel(row.source.metrics.regularMinutes)}</span> : 'Unavailable' : <span className="text-slate-400">—</span>}
+                </td>
+                <td className="px-3.5 py-2.5 font-mono text-xs font-bold">
+                  {pending ? <span className="text-amber-600">Pending</span> : row.source ? row.source.metrics ? <span className={`inline-block rounded-md px-2.5 py-1 ${otMins > 0 ? 'border border-violet-200 bg-violet-50 text-violet-800' : 'text-slate-400'}`}>{hoursLabel(otMins)}</span> : 'Unavailable' : <span className="text-slate-400">—</span>}
+                </td>
+                <td className="min-w-64 px-3.5 py-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select aria-label={`${label} entry type`} value={row.kind} disabled={readOnly} onChange={event => updateRow(row.key, { kind: event.target.value as EntryKind, timeIn: '', timeOut: '' })} className={`${fieldClass} py-1.5 text-xs font-bold text-slate-800`}><option value="work">Work</option><option value="paid">Paid leave</option><option value="unpaid">Unpaid leave</option></select>
+                    {firstOnDate && <button type="button" disabled={disabled} onClick={() => setRows(current => { const added: EntryRow = { key: `new-${++nextKey.current}`, date: row.date, kind: 'work', timeIn: '', timeOut: '', reason: '' }; const last = current.findLastIndex(item => item.date === row.date); return [...current.slice(0, last + 1), added, ...current.slice(last + 1)]; })} className="rounded-md border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-xs font-bold text-indigo-700 hover:bg-indigo-100 disabled:opacity-50" aria-label={`Add Session ${row.date}`}>+ Add Session</button>}
+                    {canRemove && (
+                      <button type="button" disabled={disabled} onClick={() => void removeSession(row, dateSessionCount)} className="rounded-md border border-rose-200 bg-rose-50 px-2.5 py-1 text-xs font-bold text-rose-700 hover:bg-rose-100 disabled:opacity-50" aria-label={`Remove Session ${row.date}`}>
+                        {!row.source && dateSessionCount > 1 ? '✕ Remove' : row.source ? 'Delete' : 'Clear'}
+                      </button>
+                    )}
+                    {changed && <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-800">{row.unconfirmed ? 'Check status' : 'Unsaved'}</span>}
                   </div>
-                  {(row.kind !== 'work' || row.reason) && <input aria-label={`${label} reason`} placeholder="Reason (optional)" value={row.reason} disabled={readOnly} onChange={event => updateRow(row.key, { reason: event.target.value })} className={`${fieldClass} mt-1 w-full py-1 text-xs`} />}
-                  {row.error && <p role="alert" className="mt-1 max-w-72 text-xs text-rose-700">{row.error}</p>}
+                  {(row.kind !== 'work' || row.reason) && <input aria-label={`${label} reason`} placeholder="Reason (optional)" value={row.reason} disabled={readOnly} onChange={event => updateRow(row.key, { reason: event.target.value })} className={`${fieldClass} mt-1.5 w-full py-1 text-xs font-medium`} />}
+                  {row.error && <p role="alert" className="mt-1 max-w-72 text-xs font-semibold text-rose-700">{row.error}</p>}
                 </td>
               </tr>;
             })}</tbody>
