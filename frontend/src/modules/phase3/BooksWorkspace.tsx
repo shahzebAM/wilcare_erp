@@ -7,6 +7,7 @@ import {
   date,
   formValue,
   input,
+  journalTotals,
   money,
   phase3Request,
   primary,
@@ -16,7 +17,7 @@ import {
   usePhase3Data,
 } from "./api";
 import type { JsonRow } from "./api";
-import FinancialReports from "./FinancialReports";
+import FinancialReports, { ReportMoney } from "./FinancialReports";
 import CashFlowWorkspace from "./CashFlowWorkspace";
 import InventoryReconciliation from "./InventoryReconciliation";
 
@@ -33,6 +34,7 @@ type Entry = {
   accountId: string;
   debit: string;
   credit: string;
+  memo?: string | null;
   account?: Account;
   statementLine?: { id: string; reconciliationId: string } | null;
 };
@@ -294,8 +296,8 @@ export default function BooksWorkspace({
   const [loadingBank, setLoadingBank] = useState("");
   const [bankError, setBankError] = useState("");
   const [lines, setLines] = useState([
-    { code: "1000", debit: "", credit: "" },
-    { code: "3000", debit: "", credit: "" },
+    { code: "1000", debit: "", credit: "", memo: "" },
+    { code: "3000", debit: "", credit: "", memo: "" },
   ]);
   const [selectedMatches, setSelectedMatches] = useState<
     Record<string, string>
@@ -305,16 +307,12 @@ export default function BooksWorkspace({
   const data = state.data;
   const activeAccounts = (data?.accounts || []).filter((account) => account.active !== false);
   const archivedAccounts = (data?.accounts || []).filter((account) => account.active === false);
-  const debit = lines.reduce((sum, line) => sum + (Number(line.debit) || 0), 0);
-  const credit = lines.reduce(
-    (sum, line) => sum + (Number(line.credit) || 0),
-    0,
-  );
+  const totals = journalTotals(lines);
   const entries = (data?.journals || []).flatMap((journal) =>
     journal.entries.map((entry) => ({
       ...entry,
       journal: journal.number,
-      memo: journal.memo,
+      memo: entry.memo ?? journal.memo,
       date: journal.date,
     })),
   );
@@ -518,82 +516,123 @@ export default function BooksWorkspace({
                       className={input}
                     />
                   </Field>
-                  <Field label="Memo">
-                    <input required name="memo" className={input} />
+                  <Field label="Journal description">
+                    <input required name="memo" maxLength={2000} className={input} />
                   </Field>
                   <Field label="Unique journal reference">
                     <input required name="reference" className={input} />
                   </Field>
                 </div>
-                {lines.map((line, index) => (
-                  <div key={index} className="grid gap-3 sm:grid-cols-4">
-                    <Field label={`Account · line ${index + 1}`}>
-                      <select
-                        required
-                        className={input}
-                        value={activeAccounts.some((account) => account.code === line.code) ? line.code : ""}
-                        onChange={(event) =>
-                          setLines((previous) =>
-                            previous.map((row, position) =>
-                              position === index
-                                ? { ...row, code: event.target.value }
-                                : row,
-                            ),
-                          )
-                        }
-                      >
-                        <option value="">Select account</option>
-                        {activeAccounts.map((account) => (
-                          <option key={account.id} value={account.code}>
-                            {account.code} · {account.name}
-                          </option>
-                        ))}
-                      </select>
-                    </Field>
-                    {(["debit", "credit"] as const).map((key) => (
-                      <Field label={`${key} (PHP)`} key={key}>
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          className={input}
-                          value={line[key]}
-                          onChange={(event) =>
-                            setLines((previous) =>
-                              previous.map((row, position) =>
-                                position === index
-                                  ? { ...row, [key]: event.target.value }
-                                  : row,
-                              ),
-                            )
-                          }
-                        />
-                      </Field>
-                    ))}
-                    {lines.length > 2 && (
-                      <button
-                        type="button"
-                        className={`${secondary} self-end`}
-                        onClick={() =>
-                          setLines((previous) =>
-                            previous.filter(
-                              (_, position) => position !== index,
-                            ),
-                          )
-                        }
-                      >
-                        Remove
-                      </button>
-                    )}
-                  </div>
-                ))}
+                <p className="text-xs text-slate-600">
+                  Enter a memo for each entry. The journal description is used when a line memo is blank.
+                </p>
+                <div className="phase3-table-scroll max-h-[28rem] overflow-auto" role="region" aria-label="Journal entry lines" tabIndex={0}>
+                  <table className="phase3-table phase3-journal-table w-full min-w-[800px] text-left text-sm" aria-label="Journal entries">
+                    <thead className="sticky top-0 bg-slate-100 text-xs uppercase text-slate-600">
+                      <tr>
+                        <th scope="col" className="px-2">#</th>
+                        <th scope="col" className="px-2">Account</th>
+                        <th scope="col" className="px-2 text-right">Debit (PHP)</th>
+                        <th scope="col" className="px-2 text-right">Credit (PHP)</th>
+                        <th scope="col" className="px-2">Memo</th>
+                        <th scope="col" className="px-2">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {lines.map((line, index) => (
+                        <tr key={index}>
+                          <th scope="row" className="px-2 text-slate-500">{index + 1}</th>
+                          <td className="w-[32%] min-w-[220px]">
+                            <select
+                              required
+                              aria-label={`Account · line ${index + 1}`}
+                              className={input}
+                              value={activeAccounts.some((account) => account.code === line.code) ? line.code : ""}
+                              onChange={(event) =>
+                                setLines((previous) =>
+                                  previous.map((row, position) =>
+                                    position === index ? { ...row, code: event.target.value } : row,
+                                  ),
+                                )
+                              }
+                            >
+                              <option value="">Select account</option>
+                              {activeAccounts.map((account) => (
+                                <option key={account.id} value={account.code}>
+                                  {account.code} · {account.name}
+                                </option>
+                              ))}
+                            </select>
+                          </td>
+                          {(["debit", "credit"] as const).map((key) => (
+                            <td className="min-w-[120px]" key={key}>
+                              <input
+                                type="number"
+                                min="0"
+                                step="0.01"
+                                aria-label={`${key === "debit" ? "Debit" : "Credit"} (PHP) · line ${index + 1}`}
+                                className={`${input} text-right`}
+                                value={line[key]}
+                                onChange={(event) =>
+                                  setLines((previous) =>
+                                    previous.map((row, position) =>
+                                      position === index ? { ...row, [key]: event.target.value } : row,
+                                    ),
+                                  )
+                                }
+                              />
+                            </td>
+                          ))}
+                          <td className="w-[34%] min-w-[220px]">
+                            <input
+                              aria-label={`Memo · line ${index + 1}`}
+                              className={input}
+                              maxLength={2000}
+                              placeholder="Memo for this entry"
+                              value={line.memo}
+                              onChange={(event) =>
+                                setLines((previous) =>
+                                  previous.map((row, position) =>
+                                    position === index ? { ...row, memo: event.target.value } : row,
+                                  ),
+                                )
+                              }
+                            />
+                          </td>
+                          <td>
+                            <button
+                              type="button"
+                              aria-label={`Remove line ${index + 1}`}
+                              className={secondary}
+                              disabled={lines.length <= 2}
+                              onClick={() => setLines((previous) => previous.filter((_, position) => position !== index))}
+                            >
+                              Remove
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot className="sticky bottom-0 bg-slate-100 font-semibold">
+                      <tr>
+                        <th scope="row" colSpan={2} className="px-2 text-right">Totals</th>
+                        <td className="text-right"><ReportMoney value={totals?.debit ?? null} /></td>
+                        <td className="text-right"><ReportMoney value={totals?.credit ?? null} /></td>
+                        <td colSpan={2}>
+                          Difference <ReportMoney value={totals?.difference ?? null} />
+                        </td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
                 <button
                   type="button"
                   className={secondary}
+                  disabled={lines.length >= 200}
                   onClick={() =>
                     setLines((previous) => [
                       ...previous,
-                      { code: "", debit: "", credit: "" },
+                      { code: "", debit: "", credit: "", memo: "" },
                     ])
                   }
                 >
@@ -601,13 +640,12 @@ export default function BooksWorkspace({
                 </button>
                 <p
                   className={
-                    Math.abs(debit - credit) < 0.005
+                    totals?.balanced
                       ? "font-semibold text-emerald-700"
                       : "font-semibold text-rose-700"
                   }
                 >
-                  Debits {money(debit)} · Credits {money(credit)} · Difference{" "}
-                  {money(debit - credit)}
+                  {totals ? totals.balanced ? "Debits and credits balance." : "Debits and credits must balance before posting." : "Enter amounts with up to two decimal places."}
                 </p>
               </Form>
             )}
@@ -621,8 +659,9 @@ export default function BooksWorkspace({
                     rows={journal.entries.map((entry) => ({
                       ...entry,
                       account: `${entry.account?.code || ""} ${entry.account?.name || entry.accountId}`,
+                      memo: entry.memo ?? journal.memo,
                     }))}
-                    columns={["account", "debit", "credit"]}
+                    columns={["account", "debit", "credit", "memo"]}
                   />
                 </details>
               ))}
@@ -820,7 +859,7 @@ export default function BooksWorkspace({
                                 ...result.entries.map((entry) => ({
                                   ...entry,
                                   journal: entry.journal.number,
-                                  memo: entry.journal.memo,
+                                  memo: entry.memo ?? entry.journal.memo,
                                   date: entry.journal.date,
                                 })),
                               ].map((entry) => [entry.id, entry]),

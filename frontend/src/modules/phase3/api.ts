@@ -42,6 +42,33 @@ export const money = (value: unknown, precision = 2) =>
     minimumFractionDigits: 2,
     maximumFractionDigits: precision,
   }).format(Number(value) || 0);
+export function journalTotals(lines: { debit: string; credit: string }[]) {
+  const cents = (value: string) => {
+    if (!value) return 0n;
+    if (!/^\d+(?:\.\d{1,2})?$/.test(value)) return null;
+    const [whole, fraction = ''] = value.split('.');
+    return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
+  };
+  let debit = 0n;
+  let credit = 0n;
+  for (const line of lines) {
+    const debitCents = cents(line.debit);
+    const creditCents = cents(line.credit);
+    if (debitCents === null || creditCents === null) return null;
+    debit += debitCents;
+    credit += creditCents;
+  }
+  const format = (value: bigint) => {
+    const magnitude = value < 0n ? -value : value;
+    return `${value < 0n ? '-' : ''}${magnitude / 100n}.${String(magnitude % 100n).padStart(2, '0')}`;
+  };
+  return {
+    debit: format(debit),
+    credit: format(credit),
+    difference: format(debit - credit),
+    balanced: debit === credit,
+  };
+}
 export const date = (value: unknown) =>
   value
     ? new Date(String(value)).toLocaleDateString('en-PH', {

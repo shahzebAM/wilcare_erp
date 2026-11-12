@@ -57,6 +57,10 @@
 .phase3-workspace .phase3-table tbody tr:last-child td { border-bottom: 0; }
 .phase3-workspace .phase3-table tbody td:first-child { font-weight: 600; color: #254a5d; }
 .phase3-workspace .phase3-table td button { padding: 7px 11px; min-height: 31px; white-space: nowrap; }
+.phase3-workspace .phase3-form:has(.phase3-journal-table) fieldset { min-width: 0; }
+.phase3-workspace .phase3-journal-table td { padding: 5px 6px; }
+.phase3-workspace .phase3-journal-table tbody tr:nth-child(even) { background: #f3f7fb; }
+.phase3-workspace .phase3-journal-table .phase3-input { min-height: 36px; padding: 6px 8px; }
 .phase3-workspace .phase3-empty { display: flex; min-height: 132px; flex-direction: column; align-items: center; justify-content: center; gap: 11px; border: 1px dashed #dbe4e8; border-radius: 8px; background: #fbfcfd; color: #71818c; font-size: 12px; }
 .phase3-workspace .phase3-empty svg { width: 26px; height: 26px; color: #9aaeb9; }
 .phase3-workspace .phase3-notice { margin: 12px 0; border: 1px solid; border-radius: 7px; font-size: 12px; }
