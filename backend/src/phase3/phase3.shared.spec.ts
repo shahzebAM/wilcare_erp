@@ -199,6 +199,85 @@ describe('Phase 3 permissions and exact journal posting', () => {
       }),
     );
   });
+  it('stores each entry memo independently after trimming it', async () => {
+    const { client, tx } = mockTransaction();
+    await postJournal(client, 'Surgicom', finance, {
+      ...journal,
+      lines: [
+        { ...journal.lines[0], memo: '  Customer receipt  ' },
+        { ...journal.lines[1], memo: 'Revenue for invoice 1' },
+      ],
+    });
+    expect(tx.accountingJournal.create).toHaveBeenCalledWith(
+      containing({
+        data: containing({
+          memo: 'Invoice',
+          entries: {
+            create: [
+              containing({
+                accountId: 'account-1300',
+                memo: 'Customer receipt',
+              }),
+              containing({
+                accountId: 'account-4000',
+                memo: 'Revenue for invoice 1',
+              }),
+            ],
+          },
+        }),
+      }),
+    );
+  });
+  it.each([undefined, null, '', '   '])(
+    'stores an omitted or blank entry memo as null (%j)',
+    async (memo) => {
+      const { client, tx } = mockTransaction();
+      await postJournal(client, 'Surgicom', finance, {
+        ...journal,
+        lines: journal.lines.map((line) => ({ ...line, memo })),
+      });
+      expect(tx.accountingJournal.create).toHaveBeenCalledWith(
+        containing({
+          data: containing({
+            entries: {
+              create: [containing({ memo: null }), containing({ memo: null })],
+            },
+          }),
+        }),
+      );
+    },
+  );
+  it('accepts a 2000-character memo without truncating it', async () => {
+    const { client, tx } = mockTransaction();
+    const memo = 'm'.repeat(2000);
+    await postJournal(client, 'Surgicom', finance, {
+      ...journal,
+      lines: [{ ...journal.lines[0], memo }, journal.lines[1]],
+    });
+    expect(tx.accountingJournal.create).toHaveBeenCalledWith(
+      containing({
+        data: containing({
+          entries: {
+            create: [containing({ memo }), containing({ memo: null })],
+          },
+        }),
+      }),
+    );
+  });
+  it('rejects an oversized entry memo before reading or writing a journal', async () => {
+    const { client, tx } = mockTransaction();
+    await expect(
+      postJournal(client, 'Surgicom', finance, {
+        ...journal,
+        lines: [
+          { ...journal.lines[0], memo: 'm'.repeat(2001) },
+          journal.lines[1],
+        ],
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(tx.accountingJournal.findUnique).not.toHaveBeenCalled();
+    expect(tx.accountingJournal.create).not.toHaveBeenCalled();
+  });
   it.each([
     [
       { code: '1300', debit: '0.30', credit: '0.01' },
@@ -243,6 +322,69 @@ describe('Phase 3 permissions and exact journal posting', () => {
     ).rejects.toBeInstanceOf(ConflictException);
     expect(tx.accountingJournal.create).not.toHaveBeenCalled();
     expect(tx.importSequence.upsert).not.toHaveBeenCalled();
+  });
+  it('retains entry memos on retries and rejects a memo-only change, including repeated accounts', async () => {
+    const { client, tx } = mockTransaction();
+    const lines = [
+      {
+        code: '1300',
+        debit: '0.30',
+        credit: '0.00',
+        memo: 'First | receipt: "A"',
+      },
+      { code: '1300', debit: '0.30', credit: '0.00', memo: 'Second receipt' },
+      { code: '4000', debit: '0.00', credit: '0.60', memo: 'Revenue' },
+    ];
+    const existing = {
+      ...journal,
+      id: 'existing',
+      status: 'POSTED',
+      entries: lines.map((line) => ({
+        account: { code: line.code },
+        debit: new Prisma.Decimal(line.debit),
+        credit: new Prisma.Decimal(line.credit),
+        memo: line.memo,
+      })),
+    };
+    tx.accountingJournal.findUnique.mockResolvedValue(existing);
+    expect(
+      await postJournal(client, 'Surgicom', finance, {
+        ...journal,
+        lines: [...lines]
+          .reverse()
+          .map((line) => ({ ...line, memo: ` ${line.memo} ` })),
+      }),
+    ).toBe(existing);
+    await expect(
+      postJournal(client, 'Surgicom', finance, {
+        ...journal,
+        lines: lines.map((line, index) => ({
+          ...line,
+          memo: index === 0 ? 'Changed receipt' : line.memo,
+        })),
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(tx.accountingJournal.create).not.toHaveBeenCalled();
+    expect(tx.importSequence.upsert).not.toHaveBeenCalled();
+  });
+  it('accepts an unchanged legacy journal retry without inserting line memos', async () => {
+    const { client, tx } = mockTransaction();
+    const existing = {
+      ...journal,
+      id: 'legacy',
+      status: 'POSTED',
+      entries: journal.lines.map((line) => ({
+        account: { code: line.code },
+        debit: new Prisma.Decimal(line.debit),
+        credit: new Prisma.Decimal(line.credit),
+        memo: null,
+      })),
+    };
+    tx.accountingJournal.findUnique.mockResolvedValue(existing);
+    expect(await postJournal(client, 'Surgicom', finance, journal)).toBe(
+      existing,
+    );
+    expect(tx.accountingJournal.create).not.toHaveBeenCalled();
   });
   it('rejects inactive or missing accounts without creating a journal', async () => {
     const { client, tx } = mockTransaction();

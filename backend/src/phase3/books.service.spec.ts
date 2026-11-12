@@ -23,7 +23,11 @@ function mockDatabase() {
     product: { findFirst: jest.fn(), findMany: jest.fn() },
     customer: { findFirst: jest.fn(), findMany: jest.fn() },
     supplier: { findFirst: jest.fn(), findMany: jest.fn() },
-    accountingJournal: { findMany: jest.fn() },
+    accountingJournal: {
+      findMany: jest.fn(),
+      findUnique: jest.fn(),
+      create: jest.fn(),
+    },
     accountingMapping: {
       findFirst: jest.fn(),
       findUnique: jest.fn(),
@@ -128,6 +132,80 @@ describe('Internal Books accounting safeguards', () => {
     mockClient.importSequence.upsert.mockResolvedValue({ value: 1 });
     service = new BooksService();
   });
+  it('passes each manual journal line memo through to its posted entry', async () => {
+    const accounts = DEFAULT_ACCOUNTS.map(([code, name, type]) => ({
+      id: `account-${code}`,
+      company: 'Surgicom',
+      code,
+      name,
+      type,
+      active: true,
+    }));
+    mockClient.ledgerAccount.findUnique.mockImplementation(
+      ({ where }: { where: { company_code: { code: string } } }) =>
+        Promise.resolve(
+          accounts.find((account) => account.code === where.company_code.code),
+        ),
+    );
+    mockClient.ledgerAccount.findMany.mockResolvedValue(
+      accounts.filter((account) => ['1300', '4000'].includes(account.code)),
+    );
+    mockClient.accountingJournal.findUnique.mockResolvedValue(null);
+    mockClient.accountingJournal.create.mockResolvedValue({ id: 'journal-1' });
+    await expect(
+      service.createJournal('Surgicom', finance, {
+        date: '2026-11-12',
+        reference: 'receipt-1',
+        memo: 'Receipt summary',
+        lines: [
+          {
+            code: '1300',
+            debit: '10.00',
+            credit: '0',
+            memo: '  Customer receipt  ',
+          },
+          {
+            code: '4000',
+            debit: '0',
+            credit: '10.00',
+            memo: 'Sale of supplies',
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ id: 'journal-1' });
+    expect(mockClient.accountingJournal.create).toHaveBeenCalledWith(
+      containing({
+        data: containing({
+          sourceKey: 'MANUAL:receipt-1',
+          memo: 'Receipt summary',
+          entries: {
+            create: [
+              containing({ memo: 'Customer receipt' }),
+              containing({ memo: 'Sale of supplies' }),
+            ],
+          },
+        }),
+      }),
+    );
+  });
+  it.each([123, false, {}, [], 'm'.repeat(2001)])(
+    'rejects an invalid manual entry memo before opening a transaction (%j)',
+    async (memo) => {
+      await expect(
+        service.createJournal('Surgicom', finance, {
+          date: '2026-11-12',
+          reference: 'receipt-1',
+          memo: 'Receipt summary',
+          lines: [
+            { code: '1300', debit: '10.00', credit: '0', memo },
+            { code: '4000', debit: '0', credit: '10.00' },
+          ],
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockClient.$transaction).not.toHaveBeenCalled();
+      expect(mockClient.accountingJournal.create).not.toHaveBeenCalled();
+    },
+  );
   it('rejects all writes for an Auditor before opening a transaction', async () => {
     await expect(
       service.initialize('Surgicom', {

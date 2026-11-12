@@ -24,6 +24,7 @@ import {
   DEFAULT_ACCOUNTS,
   hasAccess,
   initializeAccounts,
+  journalEntryMemo,
   money,
   nextNumber,
   postJournal,
@@ -546,6 +547,7 @@ export class BooksService implements OnModuleDestroy {
       code: v.text(line.code, 'Account code', true, 30)!,
       debit: money(line.debit, 'Debit').toFixed(2),
       credit: money(line.credit, 'Credit').toFixed(2),
+      memo: journalEntryMemo(line.memo),
     }));
     return this.transaction(company, actor, (tx) =>
       postJournal(tx, company, actor, {

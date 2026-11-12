@@ -224,7 +224,7 @@ export async function financialReport(
                 .toISOString()
                 .slice(0, 10),
               number: entry.journal.number,
-              memo: entry.journal.memo,
+              memo: entry.memo ?? entry.journal.memo,
               debit: entry.debit.toFixed(2),
               credit: entry.credit.toFixed(2),
               balance: running.toFixed(2),

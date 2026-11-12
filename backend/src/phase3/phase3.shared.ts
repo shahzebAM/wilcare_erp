@@ -248,8 +248,22 @@ export type JournalInput = {
   memo: string;
   /** Trusted source document gross; manual Books input never supplies this. */
   approvalAmount?: string;
-  lines: { code: string; debit: string | number; credit: string | number }[];
+  lines: {
+    code: string;
+    debit: string | number;
+    credit: string | number;
+    memo?: string | null;
+  }[];
 };
+
+export function journalEntryMemo(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || value.length > 2000)
+    throw new BadRequestException(
+      'Entry memo must contain at most 2000 characters.',
+    );
+  return value.trim() || null;
+}
 
 export async function postJournal(
   tx: Tx,
@@ -286,7 +300,12 @@ export async function postJournal(
       throw new BadRequestException(
         'Each journal entry must have exactly one positive debit or credit.',
       );
-    return { code: line.code, debit, credit };
+    return {
+      code: line.code,
+      debit,
+      credit,
+      memo: journalEntryMemo(line.memo),
+    };
   });
   const debits = lines.reduce(
     (sum, line) => sum.add(line.debit),
@@ -313,12 +332,21 @@ export async function postJournal(
   });
   if (existing) {
     const signatures = (
-      values: { code: string; debit: Prisma.Decimal; credit: Prisma.Decimal }[],
+      values: {
+        code: string;
+        debit: Prisma.Decimal;
+        credit: Prisma.Decimal;
+        memo?: string | null;
+      }[],
     ) =>
       values
-        .map(
-          (line) =>
-            `${line.code}:${line.debit.toFixed(2)}:${line.credit.toFixed(2)}`,
+        .map((line) =>
+          JSON.stringify([
+            line.code,
+            line.debit.toFixed(2),
+            line.credit.toFixed(2),
+            journalEntryMemo(line.memo),
+          ]),
         )
         .sort()
         .join('|');
@@ -371,6 +399,7 @@ export async function postJournal(
           accountId: accountIds.get(line.code)!,
           debit: line.debit,
           credit: line.credit,
+          memo: line.memo,
         })),
       },
     },
