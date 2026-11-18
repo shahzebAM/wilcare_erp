@@ -64,12 +64,39 @@ export function mappedLines(
   }));
 }
 
+function productInventoryCodes(company: string) {
+  return Prisma.sql`
+    SELECT a.code FROM "AccountingMapping" m
+    JOIN "LedgerAccount" a ON a.id=m."accountId" AND a.company=m.company
+    WHERE m.company=${company} AND m.kind='ITEM_INVENTORY'
+    UNION ALL
+    SELECT p.value->>'1200' AS code FROM "FinanceDocument" d
+    CROSS JOIN LATERAL jsonb_each(CASE WHEN jsonb_typeof(d.data->'itemPostingAccounts')='object' THEN d.data->'itemPostingAccounts' ELSE '{}'::jsonb END) p
+    WHERE d.company=${company} AND d.status='POSTED' AND d.kind='INVOICE' AND jsonb_typeof(p.value->'1200')='string'`;
+}
+
+export async function assertNotProductInventoryAccount(
+  tx: Tx,
+  company: string,
+  code: string,
+) {
+  const [usage] = await tx.$queryRaw<{ used: boolean }[]>`
+    SELECT EXISTS (SELECT 1 FROM (${productInventoryCodes(company)}) p WHERE p.code=${code}) AS used`;
+  if (usage?.used)
+    throw new BadRequestException(
+      'Choose a different account. This account is assigned to product inventory or has posted product inventory history.',
+    );
+}
+
 export async function postingControlCodes(tx: Tx, company: string) {
   const configured = await postingAccounts(tx, company);
   const history = await tx.$queryRaw<{ role: string; code: string }[]>`
-    SELECT DISTINCT p.key AS role, p.value AS code FROM "FinanceDocument" d
+    SELECT p.key AS role, p.value AS code FROM "FinanceDocument" d
     CROSS JOIN LATERAL jsonb_each_text(CASE WHEN jsonb_typeof(d.data->'postingAccounts')='object' THEN d.data->'postingAccounts' ELSE '{}'::jsonb END) p
-    WHERE d.company=${company} AND d.status='POSTED' AND d.kind IN ('INVOICE','BILL') AND p.key IN ('1200','1300','2100')`;
+    WHERE d.company=${company} AND d.status='POSTED' AND d.kind IN ('INVOICE','BILL') AND p.key IN ('1200','1300','2100')
+    UNION
+    SELECT '1200' AS role, p.code FROM (${productInventoryCodes(company)}) p
+    ORDER BY role, code`;
   return Object.fromEntries(
     ['1200', '1300', '2100'].map((code) => [
       code,
@@ -114,8 +141,8 @@ export async function sourcePostingAccounts(
   tx: Tx,
   company: string,
   document: FinanceDocument,
-  standardLines: PostingLine[],
-): Promise<PostingAccounts> {
+  resolveLines: (accounts: PostingAccounts) => PostingLine[],
+) {
   const stored = v.object(document.data).postingAccounts;
   const accounts =
     stored === undefined ? defaultPostingAccounts() : v.object(stored);
@@ -127,6 +154,7 @@ export async function sourcePostingAccounts(
       true,
       100,
     )!;
+  const lines = resolveLines(frozen);
   const journal = await tx.accountingJournal.findUnique({
     where: { company_sourceKey: { company, sourceKey: `DOC:${document.id}` } },
     include: { entries: { include: { account: true } } },
@@ -137,7 +165,7 @@ export async function sourcePostingAccounts(
     journal.sourceId !== document.id ||
     journal.sourceType !== document.kind ||
     journal.entries.some((entry) => entry.account.company !== company) ||
-    signature(mappedLines(standardLines, frozen)) !==
+    signature(lines) !==
       signature(
         journal.entries.map((entry) => ({
           code: entry.account.code,
@@ -149,5 +177,5 @@ export async function sourcePostingAccounts(
     throw new ConflictException(
       'The original posted accounts could not be verified. Finance must review this source before settlement or a memo.',
     );
-  return frozen;
+  return { accounts: frozen, lines };
 }

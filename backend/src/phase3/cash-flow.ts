@@ -12,6 +12,7 @@ import {
   type Actor,
   type Tx,
 } from './phase3.shared';
+import { assertNotProductInventoryAccount } from './posting-accounts';
 
 const Exact = Prisma.Decimal.clone({ precision: 50 });
 const D = (value: Prisma.Decimal.Value = 0) => new Exact(value);
@@ -84,6 +85,8 @@ export async function designateCashAccount(
       'Cash account settings changed. Refresh before saving.',
     );
   if (latest?.active === input.active) return latest;
+  if (input.active)
+    await assertNotProductInventoryAccount(tx, company, account.code);
   const record = await tx.cashAccountSetting.create({
     data: {
       company,

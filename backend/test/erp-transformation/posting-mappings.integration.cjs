@@ -6,6 +6,7 @@ const {PrismaClient}=require('@prisma/client');
 const {FinanceService}=require('../../src/phase3/finance.service');
 const {BooksService}=require('../../src/phase3/books.service');
 const {financialReport}=require('../../src/phase3/books.reports');
+const {inventoryReconciliation}=require('../../src/phase3/inventory-reconciliation');
 const {postJournal}=require('../../src/phase3/phase3.shared');
 const db=new PrismaClient({datasources:{db:{url}}});
 const run=Date.now(),company=`Posting QA ${run}`,other=`Posting foreign ${run}`;
@@ -66,6 +67,85 @@ async function entries(source){const j=await db.accountingJournal.findUnique({wh
  await assert.rejects(()=>finance.createMemo(company,actor,{documentId:missing.id,kind:'CREDIT_MEMO',amount:'1',reason:'Must be rejected',submissionKey:`missing-${run}`}),/could not be verified/);
  assert.equal(await db.financeDocument.count({where:{company,sourceKey:`MEMO:missing-${run}`}}),0);
  pass('Wrong-type, foreign, archived and unverifiable-source configurations fail without partial posting');
+
+ const products = await Promise.all(['Mapped', 'Default'].map((name) => db.product.create({
+   data: {
+     company,
+     name,
+     sku: `QA-${name}-${run}`,
+     category: 'Test',
+     purchasePrice: 1,
+     sellingPrice: 1,
+     unit: 'pcs',
+     vatSetting: 'NONE',
+   },
+ })));
+ const [sales, cogs, inventory] = await Promise.all(
+   [['4200', 'REVENUE'], ['5120', 'EXPENSE'], ['1220', 'ASSET']].map(([code, type]) =>
+     db.ledgerAccount.create({ data: { company, code, type, name: `Product account ${code}` } }),
+   ),
+ );
+ const selections = { salesAccountId: sales.id, cogsAccountId: cogs.id, inventoryAccountId: inventory.id };
+ await assert.rejects(
+   () => books.updateProductPostingAccounts(company, actor, products[0].id, { ...selections, inventoryAccountId: ids.BANK_CASH }),
+   /eligible active asset/,
+ );
+ await books.updateProductPostingAccounts(company, actor, products[0].id, selections);
+ assert.deepEqual((await books.productPostingAccounts(company, products[0].id)).selections, selections);
+ const productDraft = await invoice(customer, 'per-product');
+ await db.financeDocument.update({
+   where: { id: productDraft.id },
+   data: { data: { items: [
+     { productId: products[0].id, quantity: 2, unitCost: '12.005000', subtotal: '60.00' },
+     { productId: products[1].id, quantity: 1, unitCost: '3.005000', subtotal: '40.00' },
+   ] } },
+ });
+ const postedProductInvoice = await finance.postDocument(company, actor, productDraft.id);
+ assert.deepEqual(postedProductInvoice.data.itemPostingAccounts, {
+   [products[0].id]: { 4000: '4200', 5100: '5120', 1200: '1220' },
+ });
+ const productJournal = await entries(`DOC:${productDraft.id}`);
+ assert.deepEqual(productJournal, [
+   ['1210', '0.00', '3.01'], ['1220', '0.00', '24.01'],
+   ['1310', '112.00', '0.00'], ['2210', '0.00', '12.00'],
+   ['4100', '0.00', '40.00'], ['4200', '0.00', '60.00'],
+   ['5110', '3.01', '0.00'], ['5120', '24.01', '0.00'],
+ ]);
+ pass('Per-product settings post exact revenue, COGS and inventory cents with company defaults for other items');
+
+ await books.updateProductPostingAccounts(company, actor, products[0].id, {
+   salesAccountId: null,
+   cogsAccountId: null,
+   inventoryAccountId: null,
+ });
+ const productMemo = await finance.createMemo(company, actor, {
+   documentId: productDraft.id,
+   kind: 'CREDIT_MEMO',
+   amount: '56.00',
+   reason: 'Adjustment after a product account change',
+   submissionKey: `item-memo-${run}`,
+ });
+ assert.deepEqual(await entries(`DOC:${productMemo.id}`), [
+   ['1310', '0.00', '56.00'], ['2210', '6.00', '0.00'],
+   ['4100', '20.00', '0.00'], ['4200', '30.00', '0.00'],
+ ]);
+ const productPayment = await finance.createPayment(company, actor, {
+   direction: 'AR',
+   partyId: customer.id,
+   amount: '56.00',
+   paidAt: '2026-10-16',
+   method: 'Bank',
+   reference: 'Item invoice receipt',
+   idempotencyKey: `item-pay-${run}`,
+   allocations: [{ documentId: productDraft.id, amount: '56.00' }],
+ });
+ assert.deepEqual(await entries(`PAY:${productPayment.id}`), [
+   ['1010', '56.00', '0.00'], ['1310', '0.00', '56.00'],
+ ]);
+ assert.deepEqual(await entries(`DOC:${productDraft.id}`), productJournal);
+ assert((await inventoryReconciliation(db, company)).inventoryAccounts.includes('1220'));
+ pass('Changing product settings preserves posted journals, original memo and receipt accounts, and inventory history');
+
  fs.writeFileSync('.tmp/erp-transformation/completion-mapping-report.json',JSON.stringify({company,passed:checks.length,checks,productionWrites:false},null,2));
  console.log(JSON.stringify({passed:checks.length,productionWrites:false}));
 })().catch(error=>{console.error(error);process.exitCode=1}).finally(()=>db.$disconnect());

@@ -6,6 +6,7 @@ import {
 import { Prisma } from '@prisma/client';
 import type { LedgerAccount } from '@prisma/client';
 import type { SessionAdmin } from '../auth/auth-session.service';
+import { manilaDay } from '../importation/importation.validation';
 
 export type Actor = Omit<SessionAdmin, 'password'>;
 export type Tx = Prisma.TransactionClient;
@@ -151,6 +152,15 @@ export function assertApproval(
     );
 }
 
+async function incrementSequence(tx: Tx, key: string): Promise<number> {
+  const sequence = await tx.importSequence.upsert({
+    where: { key },
+    create: { key, value: 1 },
+    update: { value: { increment: 1 } },
+  });
+  return sequence.value;
+}
+
 export async function nextNumber(
   tx: Tx,
   company: string,
@@ -162,13 +172,9 @@ export async function nextNumber(
     year: 'numeric',
     timeZone: 'Asia/Manila',
   }).format(new Date());
-  const sequence = await tx.importSequence.upsert({
-    // Existing document numbers are globally unique across workspaces.
-    where: { key: `phase3:${prefix}:${year}` },
-    create: { key: `phase3:${prefix}:${year}`, value: 1 },
-    update: { value: { increment: 1 } },
-  });
-  return `${prefix}-${year}-${String(sequence.value).padStart(6, '0')}`;
+  // Existing document numbers are globally unique across workspaces.
+  const sequence = await incrementSequence(tx, `phase3:${prefix}:${year}`);
+  return `${prefix}-${year}-${String(sequence).padStart(6, '0')}`;
 }
 
 export async function audit(
@@ -271,6 +277,13 @@ export async function postJournal(
   actor: Actor,
   input: JournalInput,
 ): Promise<unknown> {
+  // An invoice can split each of its 200 items across three roles plus two controls.
+  const maxEntries =
+    input.sourceType === 'INVOICE'
+      ? 602
+      : ['CREDIT_MEMO', 'DEBIT_MEMO'].includes(input.sourceType)
+        ? 202
+        : 200;
   if (
     !input.sourceKey?.trim() ||
     input.sourceKey.length > 250 ||
@@ -282,10 +295,10 @@ export async function postJournal(
     !Number.isFinite(input.date.getTime()) ||
     !Array.isArray(input.lines) ||
     input.lines.length < 2 ||
-    input.lines.length > 200
+    input.lines.length > maxEntries
   ) {
     throw new BadRequestException(
-      'A journal requires a valid source, date, memo, and 2 to 200 entries.',
+      `A journal requires a valid source, date, memo, and 2 to ${maxEntries} entries.`,
     );
   }
   const lines = input.lines.map((line) => {
@@ -384,10 +397,14 @@ export async function postJournal(
   const accountIds = new Map(
     accounts.map((account) => [account.code, account.id]),
   );
+  const calendarDate = manilaDay(input.date);
+  const [year, month, day] = calendarDate.split('-');
+  const sequence = await incrementSequence(tx, `phase3:JRN:${calendarDate}`);
+  const number = `JRN-${String(sequence).padStart(2, '0')}-${month}/${day}/${year.padStart(4, '0')}`;
   const journal = await tx.accountingJournal.create({
     data: {
       company,
-      number: await nextNumber(tx, company, 'JRN'),
+      number,
       sourceKey: input.sourceKey,
       sourceType: input.sourceType,
       sourceId: input.sourceId,
@@ -406,6 +423,8 @@ export async function postJournal(
     include: { entries: { include: { account: true } } },
   });
   await audit(tx, company, actor, 'POST', 'AccountingJournal', journal.id, {
+    number,
+    description: input.memo,
     sourceKey: input.sourceKey,
     sourceType: input.sourceType,
     sourceId: input.sourceId,

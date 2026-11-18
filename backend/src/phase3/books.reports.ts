@@ -378,7 +378,7 @@ export async function financialReport(
           inventory: control('1200'),
         },
         controlAccountScope:
-          'Cash uses currently designated cash/bank accounts. AR, AP and Inventory include standard, configured and frozen historical posting-role accounts. Subsidiary balances and reference inventory values remain separate.',
+          'Cash uses currently designated cash/bank accounts. AR, AP and Inventory include standard, configured and historical posting accounts. Inventory includes current and historically posted product inventory accounts. Subsidiary balances and reference inventory values remain separate.',
       };
     },
     {

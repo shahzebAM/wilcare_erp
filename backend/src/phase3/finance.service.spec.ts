@@ -305,6 +305,117 @@ describe('Phase 3 Finance service business safeguards', () => {
       }),
     );
   });
+  it('posts mixed invoice products to their own accounts or to the respective company defaults', async () => {
+    db.financeDocument.findFirst.mockResolvedValue(
+      document({
+        status: 'DRAFT',
+        data: {
+          items: [
+            {
+              productId: 1,
+              quantity: 2,
+              unitCost: '25.005000',
+              subtotal: '60.00',
+            },
+            {
+              productId: 2,
+              quantity: 1,
+              unitCost: '5.005000',
+              subtotal: '40.00',
+            },
+          ],
+        },
+      }),
+    );
+    const account = (code: string, type: string) => ({
+      code,
+      type,
+      active: true,
+      company: 'Test',
+    });
+    db.accountingMapping.findMany
+      .mockResolvedValueOnce([
+        { sourceId: 'SALES_REVENUE', account: account('4200', 'REVENUE') },
+        { sourceId: 'IMPORT_EXPENSE', account: account('5010', 'EXPENSE') },
+      ])
+      .mockResolvedValueOnce([
+        {
+          kind: 'ITEM_SALES',
+          sourceId: '1',
+          account: account('4100', 'REVENUE'),
+        },
+        {
+          kind: 'ITEM_COGS',
+          sourceId: '1',
+          account: account('5000', 'EXPENSE'),
+        },
+        {
+          kind: 'ITEM_INVENTORY',
+          sourceId: '1',
+          account: account('1210', 'ASSET'),
+        },
+      ]);
+
+    const posted = await service.postDocument('Test', actor(), 'invoice-1');
+
+    expect(db.accountingMapping.findMany).toHaveBeenLastCalledWith({
+      where: {
+        company: 'Test',
+        kind: { in: ['ITEM_SALES', 'ITEM_COGS', 'ITEM_INVENTORY'] },
+        sourceId: { in: ['1', '2'] },
+      },
+      include: { account: true },
+    });
+    expect(posted.data).toMatchObject({
+      postingAccounts: { '4000': '4200', '5000': '5010' },
+      itemPostingAccounts: {
+        '1': { '4000': '4100', '5100': '5000', '1200': '1210' },
+      },
+    });
+    expect(jest.mocked(postJournal).mock.calls[0][3].lines).toEqual([
+      { code: '1300', debit: '112.00', credit: '0.00' },
+      { code: '2200', debit: '0.00', credit: '12.00' },
+      { code: '4100', debit: '0.00', credit: '60.00' },
+      { code: '4200', debit: '0.00', credit: '40.00' },
+      { code: '5000', debit: '50.01', credit: '0.00' },
+      { code: '5100', debit: '5.01', credit: '0.00' },
+      { code: '1210', debit: '0.00', credit: '50.01' },
+      { code: '1200', debit: '0.00', credit: '5.01' },
+    ]);
+  });
+  it.each([
+    { active: false },
+    { company: 'Other' },
+    { type: 'EXPENSE' },
+    { code: '1300' },
+  ])(
+    'rejects ineligible item inventory accounts before posting (%j)',
+    async (invalid) => {
+      db.financeDocument.findFirst.mockResolvedValue(
+        document({ status: 'DRAFT' }),
+      );
+      db.accountingMapping.findMany
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([
+          {
+            kind: 'ITEM_INVENTORY',
+            sourceId: '1',
+            account: {
+              code: '1210',
+              type: 'ASSET',
+              company: 'Test',
+              active: true,
+              ...invalid,
+            },
+          },
+        ]);
+      await expect(
+        service.postDocument('Test', actor(), 'invoice-1'),
+      ).rejects.toThrow('invalid, archived or incompatible posting account');
+      expect(postJournal).not.toHaveBeenCalled();
+      expect(db.financeDocument.update).not.toHaveBeenCalled();
+    },
+  );
   it('posts bills to their selected inventory/expense accounts and input VAT', async () => {
     db.financeDocument.findFirst.mockResolvedValue(
       document({
@@ -464,6 +575,163 @@ describe('Phase 3 Finance service business safeguards', () => {
     reason: 'Adjustment',
     submissionKey: 'memo-test',
     ...overrides,
+  });
+  it('fully reverses item revenue across one-cent memos, including signed rounding reclassifications', async () => {
+    const original = document({
+      total: d('0.10'),
+      subtotal: d('0.09'),
+      taxAmount: d('0.01'),
+      data: {
+        items: [
+          { productId: 1, quantity: 1, unitCost: '0.00', subtotal: '0.05' },
+          { productId: 2, quantity: 1, unitCost: '0.00', subtotal: '0.03' },
+          { productId: 3, quantity: 1, unitCost: '0.00', subtotal: '0.01' },
+        ],
+        itemPostingAccounts: {
+          '1': { '4000': '4100' },
+          '3': { '4000': '4300' },
+        },
+      },
+    });
+    const memos: Awaited<ReturnType<FinanceService['createMemo']>>[] = [];
+    db.financeDocument.findFirst.mockImplementation(() =>
+      Promise.resolve({ ...original, memos }),
+    );
+    db.accountingJournal.findUnique.mockResolvedValue({
+      sourceId: original.id,
+      sourceType: original.kind,
+      status: 'POSTED',
+      entries: [
+        ['1300', '0.10', '0.00'],
+        ['2200', '0.00', '0.01'],
+        ['4100', '0.00', '0.05'],
+        ['4000', '0.00', '0.03'],
+        ['4300', '0.00', '0.01'],
+      ].map(([code, debit, credit]) => ({
+        account: { code, company: original.company },
+        debit: d(debit),
+        credit: d(credit),
+      })),
+    });
+    for (let index = 0; index < 10; index++) {
+      memos.push(
+        await service.createMemo(
+          'Test',
+          actor(),
+          memoInput({
+            amount: '0.01',
+            submissionKey: `item-credit-${index}`,
+          }),
+        ),
+      );
+    }
+    const debits = new Map<string, Prisma.Decimal>();
+    for (const [, , , journal] of jest.mocked(postJournal).mock.calls) {
+      expect(
+        journal.lines
+          .reduce((net, line) => net.add(line.debit).sub(line.credit), d(0))
+          .toFixed(2),
+      ).toBe('0.00');
+      for (const line of journal.lines) {
+        debits.set(
+          line.code,
+          (debits.get(line.code) ?? d(0)).add(line.debit).sub(line.credit),
+        );
+      }
+    }
+    expect(memos[5].data).toMatchObject({
+      accountAllocations: [
+        { code: '4100', amount: '0.01' },
+        { code: '4000', amount: '0.01' },
+        { code: '4300', amount: '-0.01' },
+      ],
+    });
+    expect([...debits.keys()].sort()).toEqual([
+      '1300',
+      '2200',
+      '4000',
+      '4100',
+      '4300',
+    ]);
+    expect(debits.get('1300')?.toFixed(2)).toBe('-0.10');
+    expect(debits.get('2200')?.toFixed(2)).toBe('0.01');
+    expect(debits.get('4000')?.toFixed(2)).toBe('0.03');
+    expect(debits.get('4100')?.toFixed(2)).toBe('0.05');
+    expect(debits.get('4300')?.toFixed(2)).toBe('0.01');
+    expect(db.accountingMapping.findMany).not.toHaveBeenCalled();
+  });
+  it('posts and reverses a legacy tax-only invoice without reading missing item subtotals', async () => {
+    const original = document({
+      total: d('0.01'),
+      subtotal: d('0'),
+      taxAmount: d('0.01'),
+      data: {
+        items: [{ productId: 1, quantity: 1, unitCost: '0.00' }],
+        itemPostingAccounts: { '1': { '4000': '4100' } },
+      },
+    });
+    db.financeDocument.findFirst
+      .mockResolvedValueOnce({ ...original, status: 'DRAFT' })
+      .mockResolvedValue(original);
+    db.accountingMapping.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          kind: 'ITEM_SALES',
+          sourceId: '1',
+          account: {
+            code: '4100',
+            type: 'REVENUE',
+            company: 'Test',
+            active: true,
+          },
+        },
+      ]);
+
+    await service.postDocument('Test', actor(), 'invoice-1');
+    await service.createMemo('Test', actor(), memoInput({ amount: '0.01' }));
+
+    expect(
+      jest
+        .mocked(postJournal)
+        .mock.calls.map(([, , , journal]) => journal.lines),
+    ).toEqual([
+      [
+        { code: '1300', debit: '0.01', credit: '0.00' },
+        { code: '2200', debit: '0.00', credit: '0.01' },
+      ],
+      [
+        { code: '1300', debit: '0.00', credit: '0.01' },
+        { code: '2200', debit: '0.01', credit: '0.00' },
+      ],
+    ]);
+  });
+  it('rejects payments and memos whose frozen item accounts disagree with the original journal', async () => {
+    db.financeDocument.findFirst.mockResolvedValue(
+      document({
+        data: {
+          items: [
+            {
+              productId: 1,
+              quantity: 2,
+              unitCost: '25.00',
+              subtotal: '100.00',
+            },
+          ],
+          itemPostingAccounts: { '1': { '4000': '4100' } },
+        },
+      }),
+    );
+    // The saved journal still shows the revenue posted to account 4000.
+    await expect(
+      service.createMemo('Test', actor(), memoInput()),
+    ).rejects.toThrow('could not be verified');
+    await expect(
+      service.createPayment('Test', actor(), payment()),
+    ).rejects.toThrow('could not be verified');
+    expect(db.financeDocument.create).not.toHaveBeenCalled();
+    expect(db.financePayment.create).not.toHaveBeenCalled();
+    expect(postJournal).not.toHaveBeenCalled();
   });
   it('returns an exact memo replay without another number, document, journal or audit', async () => {
     const first = await service.createMemo('Test', actor(), memoInput());

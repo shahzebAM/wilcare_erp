@@ -2,6 +2,7 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
 const url='postgresql://phase3_test@127.0.0.1:55439/customer_guide_20261023b?schema=public';process.env.DATABASE_URL=url;
 require('ts-node').register({transpileOnly:true,project:path.resolve(__dirname,'../../tsconfig.json')});
 const {PrismaClient}=require('@prisma/client');const {BooksService}=require('../../src/phase3/books.service');const {postJournal}=require('../../src/phase3/phase3.shared');
+const { FinanceService } = require('../../src/phase3/finance.service');
 const db=new PrismaClient({datasources:{db:{url}}}),books=Object.create(BooksService.prototype);books.prisma=db;
 const run=Date.now(),company=`Inventory reconciliation QA ${run}`,actor={id:1,username:'inventory-reconciliation-audit',role:'Super Admin',modules:{}};
 const checks=[];const pass=text=>{checks.push(text);console.log('PASS: '+text)};
@@ -40,5 +41,49 @@ const product=(suffix,data={})=>db.product.create({data:{company,sku:`REC-${suff
  assert.throws(()=>books.inventoryReconciliation(company,booksOnly),/Books and Finance/);
  assert.deepEqual(await db.product.findUnique({where:{id:item.id}}),before.item);assert.deepEqual(await db.warehouseStock.findUnique({where:{id:stock.id}}),before.stock);assert.equal(await db.productCostHistory.count({where:{company}}),before.costHistory);assert.equal(await db.accountingJournal.count({where:{company}}),before.journals+1);
  pass('Books-only access fails; reconciliation reads preserve quantities, prices, cost history and journals');
+
+ const sales = await db.ledgerAccount.create({ data: { company, code: '4120', name: 'Item sales', type: 'REVENUE' } });
+ const cogs = await db.ledgerAccount.create({ data: { company, code: '5120', name: 'Item cost', type: 'EXPENSE' } });
+ const inventory = await db.ledgerAccount.create({ data: { company, code: '1220', name: 'Item inventory', type: 'ASSET' } });
+ const bank = await db.ledgerAccount.findUnique({ where: { company_code: { company, code: '1000' } } });
+ const defaults = { salesAccountId: null, cogsAccountId: null, inventoryAccountId: null };
+ const selected = { salesAccountId: sales.id, cogsAccountId: cogs.id, inventoryAccountId: inventory.id };
+ const initialSettings = await books.productPostingAccounts(company, item.id);
+ assert.deepEqual(initialSettings.selections, defaults);
+ assert.equal(initialSettings.accounts.some(account => account.id === bank.id), false);
+ await assert.rejects(books.updateProductPostingAccounts(company, actor, item.id, { ...selected, inventoryAccountId: bank.id }), /eligible active asset/);
+ await assert.rejects(books.updateProductPostingAccounts(company, actor, item.id, { ...selected, cogsAccountId: sales.id }), /eligible active expense/);
+ await assert.rejects(books.productPostingAccounts(`${company} foreign`, item.id), /Product not found/);
+ const auditor = { ...actor, role: 'Admin', modules: { books: true, erpRoles: ['Auditor'] } };
+ await assert.rejects(books.updateProductPostingAccounts(company, auditor, item.id, selected), /Books write access/);
+ assert.deepEqual((await books.productPostingAccounts(company, item.id)).selections, defaults);
+ assert.deepEqual((await books.updateProductPostingAccounts(company, actor, item.id, selected)).selections, selected);
+ assert.deepEqual((await books.productPostingAccounts(company, item.id)).selections, selected);
+ await assert.rejects(books.setMapping(company, actor, { kind: 'POSTING_ROLE', sourceId: 'AR_CONTROL', accountId: inventory.id }), /assigned to product inventory/);
+ pass('Product overrides use active role-specific accounts, protect bank controls and enforce company and write access');
+
+ const finance = Object.create(FinanceService.prototype);
+ finance.prisma = db;
+ const customer = await db.customer.create({ data: { company, name: 'Synthetic item posting customer' } });
+ const invoice = await db.financeDocument.create({ data: {
+   company, number: `INV-ITEM-REC-${run}`, kind: 'INVOICE', direction: 'AR', partyId: customer.id,
+   status: 'DRAFT', exchangeRate: '1', issueDate: new Date(), dueDate: new Date(),
+   subtotal: '100', taxAmount: '0', total: '100', createdBy: actor.username,
+   data: { items: [{ productId: item.id, quantity: 1, unitCost: '25', subtotal: '100' }] },
+ } });
+ await finance.postDocument(company, actor, invoice.id);
+ result = await books.inventoryReconciliation(company, actor);
+ assert(result.inventoryAccounts.includes(inventory.code));
+ assert.equal(result.totals.inventoryLedger, '1225.00');
+ await assert.rejects(books.setCashAccount(company, actor, { accountId: inventory.id, active: true, expectedVersion: 0 }), /posted product inventory history/);
+ await books.updateProductPostingAccounts(company, actor, item.id, defaults);
+ assert.deepEqual((await books.productPostingAccounts(company, item.id)).selections, defaults);
+ result = await books.inventoryReconciliation(company, actor);
+ assert(result.inventoryAccounts.includes(inventory.code));
+ assert.equal(result.totals.inventoryLedger, '1225.00');
+ const history = await db.erpAuditLog.findMany({ where: { company, entityType: 'ProductPostingAccounts', entityId: String(item.id) } });
+ assert.equal(history.length, 2);
+ assert(history.some(record => record.details['Inventory asset account'].account === 'Company default'));
+ pass('Posted product inventory balances remain in reconciliation after clearing overrides and both changes remain in audit history');
  fs.writeFileSync('.tmp/erp-transformation/completion-inventory-report.json',JSON.stringify({company,passed:checks.length,checks,productionWrites:false},null,2));console.log(JSON.stringify({passed:checks.length,productionWrites:false}));
 })().catch(error=>{console.error(error);process.exitCode=1}).finally(()=>db.$disconnect());

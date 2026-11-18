@@ -5,6 +5,7 @@ import {
   Get,
   Headers,
   Param,
+  ParseIntPipe,
   Post,
   Query,
   Req,
@@ -130,6 +131,29 @@ export class BooksController {
     @Body() body: unknown,
   ) {
     return this.books.setMapping(company, request.user, body);
+  }
+
+  @Get('books/products/:id/posting-accounts')
+  productPostingAccounts(
+    @Headers('x-company') company: string,
+    @Param('id', ParseIntPipe) id: number,
+  ) {
+    return this.books.productPostingAccounts(company, id);
+  }
+
+  @Post('books/products/:id/posting-accounts')
+  updateProductPostingAccounts(
+    @Headers('x-company') company: string,
+    @Req() request: Phase3Request,
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: unknown,
+  ) {
+    return this.books.updateProductPostingAccounts(
+      company,
+      request.user,
+      id,
+      body,
+    );
   }
 
   @Post('books/reconciliations')

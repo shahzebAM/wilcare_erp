@@ -179,6 +179,7 @@ describe('Phase 3 permissions and exact journal posting', () => {
     ).resolves.toMatchObject({
       id: 'journal-1',
       company: 'Surgicom',
+      number: 'JRN-01-10/01/2026',
       sourceKey: journal.sourceKey,
     });
     expect(tx.ledgerAccount.findMany).toHaveBeenCalledWith({
@@ -194,9 +195,42 @@ describe('Phase 3 permissions and exact journal posting', () => {
           company: 'Surgicom',
           actorId: 7,
           action: 'POST',
-          details: containing({ total: '0.30' }),
+          details: containing({
+            number: 'JRN-01-10/01/2026',
+            description: 'Invoice',
+            total: '0.30',
+          }),
         }),
       }),
+    );
+  });
+  it('increments the journal date sequence past 99 and resets at Manila midnight', async () => {
+    const { client, tx } = mockTransaction();
+    tx.importSequence.upsert
+      .mockResolvedValueOnce({ value: 99 })
+      .mockResolvedValueOnce({ value: 100 });
+    const inputs = [
+      ['2026-12-31T14:00:00Z', journal.sourceKey, 'JRN-99-12/31/2026'],
+      ['2026-12-31T15:59:59Z', 'TEST:invoice-2', 'JRN-100-12/31/2026'],
+      ['2026-12-31T16:00:00Z', 'TEST:invoice-3', 'JRN-01-01/01/2027'],
+    ];
+    for (const [date, sourceKey, number] of inputs) {
+      await expect(
+        postJournal(client, 'Surgicom', finance, {
+          ...journal,
+          sourceKey,
+          date: new Date(date),
+        }),
+      ).resolves.toMatchObject({ number });
+    }
+    expect(tx.importSequence.upsert.mock.calls).toEqual(
+      ['2026-12-31', '2026-12-31', '2027-01-01'].map((date) => [
+        {
+          where: { key: `phase3:JRN:${date}` },
+          create: { key: `phase3:JRN:${date}`, value: 1 },
+          update: { value: { increment: 1 } },
+        },
+      ]),
     );
   });
   it('stores each entry memo independently after trimming it', async () => {
@@ -277,6 +311,29 @@ describe('Phase 3 permissions and exact journal posting', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(tx.accountingJournal.findUnique).not.toHaveBeenCalled();
     expect(tx.accountingJournal.create).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['INVOICE', 602],
+    ['CREDIT_MEMO', 202],
+    ['DEBIT_MEMO', 202],
+    ['MANUAL', 200],
+  ])('enforces the %s journal line limit of %i', async (sourceType, limit) => {
+    const { client, tx } = mockTransaction();
+    const lines = Array.from(
+      { length: limit },
+      (_, index) => journal.lines[index % 2],
+    );
+    const input = { ...journal, sourceType, lines };
+    await expect(
+      postJournal(client, 'Surgicom', finance, input),
+    ).resolves.toMatchObject({ id: 'journal-1' });
+    await expect(
+      postJournal(client, 'Surgicom', finance, {
+        ...input,
+        lines: [...lines, journal.lines[0]],
+      }),
+    ).rejects.toThrow(`2 to ${limit} entries`);
+    expect(tx.accountingJournal.create).toHaveBeenCalledTimes(1);
   });
   it.each([
     [
@@ -372,6 +429,7 @@ describe('Phase 3 permissions and exact journal posting', () => {
     const existing = {
       ...journal,
       id: 'legacy',
+      number: 'JRN-2026-000001',
       status: 'POSTED',
       entries: journal.lines.map((line) => ({
         account: { code: line.code },
@@ -385,6 +443,7 @@ describe('Phase 3 permissions and exact journal posting', () => {
       existing,
     );
     expect(tx.accountingJournal.create).not.toHaveBeenCalled();
+    expect(tx.importSequence.upsert).not.toHaveBeenCalled();
   });
   it('rejects inactive or missing accounts without creating a journal', async () => {
     const { client, tx } = mockTransaction();

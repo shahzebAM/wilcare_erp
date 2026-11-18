@@ -132,7 +132,7 @@ describe('Internal Books accounting safeguards', () => {
     mockClient.importSequence.upsert.mockResolvedValue({ value: 1 });
     service = new BooksService();
   });
-  it('passes each manual journal line memo through to its posted entry', async () => {
+  it('uses a submission key for manual journal retries and preserves line memos', async () => {
     const accounts = DEFAULT_ACCOUNTS.map(([code, name, type]) => ({
       id: `account-${code}`,
       company: 'Surgicom',
@@ -155,7 +155,7 @@ describe('Internal Books accounting safeguards', () => {
     await expect(
       service.createJournal('Surgicom', finance, {
         date: '2026-11-12',
-        reference: 'receipt-1',
+        submissionKey: 'receipt-1',
         memo: 'Receipt summary',
         lines: [
           {
@@ -177,6 +177,7 @@ describe('Internal Books accounting safeguards', () => {
       containing({
         data: containing({
           sourceKey: 'MANUAL:receipt-1',
+          number: 'JRN-01-11/12/2026',
           memo: 'Receipt summary',
           entries: {
             create: [

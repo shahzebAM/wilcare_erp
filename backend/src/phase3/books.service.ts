@@ -15,8 +15,16 @@ import {
   designateCashAccount,
   classifyCashEntry,
 } from './cash-flow';
-import { POSTING_ROLES, postingAccounts } from './posting-accounts';
+import {
+  assertNotProductInventoryAccount,
+  POSTING_ROLES,
+  postingAccounts,
+} from './posting-accounts';
 import { inventoryReconciliation } from './inventory-reconciliation';
+import {
+  getProductPostingAccounts,
+  saveProductPostingAccounts,
+} from './product-posting-accounts';
 import {
   Actor,
   assertApproval,
@@ -541,8 +549,13 @@ export class BooksService implements OnModuleDestroy {
     const input = v.object(body);
     const date = v.date(input.date, 'Journal date');
     if (!date) throw new BadRequestException('Journal date is required.');
-    const reference = v.text(input.reference, 'Unique reference', true, 150)!;
-    const memo = v.text(input.memo, 'Memo', true, 2000)!;
+    const submissionKey = v.text(
+      input.submissionKey ?? input.reference,
+      'Journal submission key',
+      true,
+      150,
+    )!;
+    const memo = v.text(input.memo, 'Journal description', true, 2000)!;
     const lines = v.rows(input.lines).map((line) => ({
       code: v.text(line.code, 'Account code', true, 30)!,
       debit: money(line.debit, 'Debit').toFixed(2),
@@ -551,9 +564,9 @@ export class BooksService implements OnModuleDestroy {
     }));
     return this.transaction(company, actor, (tx) =>
       postJournal(tx, company, actor, {
-        sourceKey: `MANUAL:${reference}`,
+        sourceKey: `MANUAL:${submissionKey}`,
         sourceType: 'MANUAL',
-        sourceId: reference,
+        sourceId: submissionKey,
         date,
         memo,
         lines,
@@ -577,6 +590,12 @@ export class BooksService implements OnModuleDestroy {
         throw new BadRequestException(
           'Select a valid posting role and an account with its required type.',
         );
+      if (
+        kind === 'POSTING_ROLE' &&
+        role?.[2] === 'ASSET' &&
+        role[1] !== '1200'
+      )
+        await assertNotProductInventoryAccount(tx, company, account.code);
       const source =
         kind === 'POSTING_ROLE'
           ? { id: sourceId }
@@ -644,6 +663,24 @@ export class BooksService implements OnModuleDestroy {
       );
       return mapping;
     });
+  }
+
+  productPostingAccounts(company: string, id: number) {
+    return this.prisma.$transaction(
+      (tx) => getProductPostingAccounts(tx, company, id),
+      { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead },
+    );
+  }
+
+  updateProductPostingAccounts(
+    company: string,
+    actor: Actor,
+    id: number,
+    body: unknown,
+  ) {
+    return this.transaction(company, actor, (tx) =>
+      saveProductPostingAccounts(tx, company, actor, id, body),
+    );
   }
 
   async createReconciliation(company: string, actor: Actor, body: unknown) {

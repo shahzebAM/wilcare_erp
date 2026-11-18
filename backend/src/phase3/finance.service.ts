@@ -13,7 +13,10 @@ import {
   mappedLines,
   postingAccounts,
   sourcePostingAccounts,
+  type PostingAccounts,
+  type PostingLine,
 } from './posting-accounts';
+import { PRODUCT_POSTING_ROLES } from './product-posting-accounts';
 import {
   Actor,
   Tx,
@@ -43,6 +46,11 @@ const balanceInclude = {
   allocations: { include: { payment: true } },
 } satisfies Prisma.FinanceDocumentInclude;
 const MAX_BALANCES = 5000;
+type ItemPostingCode = (typeof PRODUCT_POSTING_ROLES)[number][2];
+type ItemPostingAccounts = Record<
+  string,
+  Partial<Record<ItemPostingCode, string>>
+>;
 function json(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
 }
@@ -53,6 +61,42 @@ function requiredDate(value: unknown, label: string) {
 }
 function id(value: unknown, label = 'ID') {
   return v.text(value, label, true, 200)!;
+}
+function journalPostingLine(
+  code: string,
+  amount: Prisma.Decimal,
+  debit: boolean,
+): PostingLine {
+  return {
+    code,
+    debit: debit ? amount.toFixed(2) : '0.00',
+    credit: debit ? '0.00' : amount.toFixed(2),
+  };
+}
+function itemAccountSnapshot(document: FinanceDocument): ItemPostingAccounts {
+  const stored = v.object(document.data).itemPostingAccounts;
+  if (document.kind !== 'INVOICE' || stored === undefined) return {};
+  return Object.fromEntries(
+    Object.entries(v.object(stored)).map(([productId, raw]) => {
+      const accounts = v.object(raw);
+      return [
+        productId,
+        Object.fromEntries(
+          PRODUCT_POSTING_ROLES.filter(([, , code]) => code in accounts).map(
+            ([, , code]) => [
+              code,
+              v.text(
+                accounts[code],
+                'Original product posting account',
+                true,
+                100,
+              )!,
+            ],
+          ),
+        ),
+      ];
+    }),
+  );
 }
 function allocateMemoAccounts(
   total: Prisma.Decimal,
@@ -794,14 +838,10 @@ export class FinanceService implements OnModuleDestroy {
   }
 
   private documentLines(document: FinanceDocument, reverse = false) {
-    const lines: { code: string; debit: string; credit: string }[] = [];
+    const lines: PostingLine[] = [];
     const add = (code: string, amount: Prisma.Decimal, debit: boolean) => {
       if (amount.isZero()) return;
-      lines.push({
-        code,
-        debit: (debit !== reverse ? amount : new Prisma.Decimal(0)).toFixed(2),
-        credit: (debit !== reverse ? new Prisma.Decimal(0) : amount).toFixed(2),
-      });
+      lines.push(journalPostingLine(code, amount, debit !== reverse));
     };
     if (document.direction === 'AR') {
       add('1300', document.total, true);
@@ -833,26 +873,106 @@ export class FinanceService implements OnModuleDestroy {
     return lines;
   }
 
-  private postingLines(document: FinanceDocument) {
-    const lines = this.documentLines(document);
-    if (document.kind === 'INVOICE') {
-      const cost = sum(
-        v
-          .rows(v.object(document.data).items)
-          .map((line) =>
-            roundMoney(
-              decimal(line.unitCost, 'Stored cost').mul(
-                v.integer(line.quantity, 'Stored quantity', 1),
-              ),
-            ),
-          ),
+  private async invoiceItemAccounts(
+    tx: Tx,
+    company: string,
+    document: FinanceDocument,
+    accounts: PostingAccounts,
+  ): Promise<ItemPostingAccounts> {
+    if (document.kind !== 'INVOICE') return {};
+    const items = v.rows(v.object(document.data).items);
+    const productIds = [
+      ...new Set(items.map((item) => String(item.productId))),
+    ];
+    const mappings = await tx.accountingMapping.findMany({
+      where: {
+        company,
+        kind: { in: PRODUCT_POSTING_ROLES.map(([, kind]) => kind) },
+        sourceId: { in: productIds },
+      },
+      include: { account: true },
+    });
+    const overrides: ItemPostingAccounts = {};
+    for (const mapping of mappings) {
+      const role = PRODUCT_POSTING_ROLES.find(
+        ([, kind]) => kind === mapping.kind,
       );
-      if (cost.gt(0))
-        lines.push(
-          { code: '5100', debit: cost.toFixed(2), credit: '0.00' },
-          { code: '1200', debit: '0.00', credit: cost.toFixed(2) },
+      const account = mapping.account;
+      if (
+        !role ||
+        !account.active ||
+        account.company !== company ||
+        account.type !== role[3] ||
+        (role[2] === '1200' &&
+          ['1000', '1300', '1400'].some(
+            (code) => code === account.code || accounts[code] === account.code,
+          ))
+      )
+        throw new ConflictException(
+          'An invoice product has an invalid, archived or incompatible posting account. Review its product account settings before posting.',
         );
+      const product = (overrides[mapping.sourceId] ??= {});
+      product[role[2]] = account.code;
     }
+    return overrides;
+  }
+
+  private postingLines(
+    document: FinanceDocument,
+    accounts: PostingAccounts,
+    overrides: ItemPostingAccounts = itemAccountSnapshot(document),
+  ): PostingLine[] {
+    const standardLines = this.documentLines(document);
+    if (document.kind !== 'INVOICE')
+      return mappedLines(standardLines, accounts);
+
+    const splitRevenue =
+      !document.subtotal.isZero() &&
+      Object.values(overrides).some((item) => item['4000']);
+    const lines = mappedLines(
+      standardLines.filter((line) => !splitRevenue || line.code !== '4000'),
+      accounts,
+    );
+    const revenue = new Map<string, Prisma.Decimal>();
+    const expense = new Map<string, Prisma.Decimal>();
+    const inventory = new Map<string, Prisma.Decimal>();
+    const add = (
+      amounts: Map<string, Prisma.Decimal>,
+      code: string,
+      amount: Prisma.Decimal,
+    ) => {
+      if (!amount.isZero())
+        amounts.set(
+          code,
+          (amounts.get(code) ?? new Prisma.Decimal(0)).add(amount),
+        );
+    };
+    for (const item of v.rows(v.object(document.data).items)) {
+      const product = overrides[String(item.productId)];
+      if (splitRevenue)
+        add(
+          revenue,
+          product?.['4000'] ?? accounts['4000'],
+          money(item.subtotal, 'Stored invoice line subtotal'),
+        );
+      const cost = roundMoney(
+        decimal(item.unitCost, 'Stored cost').mul(
+          v.integer(item.quantity, 'Stored quantity', 1),
+        ),
+      );
+      add(expense, product?.['5100'] ?? accounts['5100'], cost);
+      add(inventory, product?.['1200'] ?? accounts['1200'], cost);
+    }
+    if (splitRevenue && !sum([...revenue.values()]).eq(document.subtotal))
+      throw new ConflictException(
+        'Product line subtotals do not match the invoice subtotal.',
+      );
+    for (const [code, amount] of revenue)
+      lines.push(journalPostingLine(code, amount, false));
+    for (const [code, amount] of expense)
+      lines.push(journalPostingLine(code, amount, true));
+    for (const [code, amount] of inventory)
+      lines.push(journalPostingLine(code, amount, false));
     return lines;
   }
 
@@ -870,7 +990,13 @@ export class FinanceService implements OnModuleDestroy {
           'Only draft invoices and bills can be posted.',
         );
       const accounts = await postingAccounts(tx, company);
-      const lines = mappedLines(this.postingLines(document), accounts);
+      const itemAccounts = await this.invoiceItemAccounts(
+        tx,
+        company,
+        document,
+        accounts,
+      );
+      const lines = this.postingLines(document, accounts, itemAccounts);
       await postJournal(tx, company, actor, {
         sourceKey: `DOC:${document.id}`,
         sourceType: document.kind,
@@ -886,7 +1012,13 @@ export class FinanceService implements OnModuleDestroy {
           status: 'POSTED',
           postedAt: new Date(),
           postedBy: actor.username,
-          data: json({ ...v.object(document.data), postingAccounts: accounts }),
+          data: json({
+            ...v.object(document.data),
+            postingAccounts: accounts,
+            ...(Object.keys(itemAccounts).length && {
+              itemPostingAccounts: itemAccounts,
+            }),
+          }),
         },
       });
       await audit(tx, company, actor, 'POST', 'FinanceDocument', document.id, {
@@ -939,11 +1071,12 @@ export class FinanceService implements OnModuleDestroy {
           throw new BadRequestException(
             'Memos require a posted invoice or bill.',
           );
-        const accounts = await sourcePostingAccounts(
+        const itemAccounts = itemAccountSnapshot(original);
+        const { accounts, lines: originalLines } = await sourcePostingAccounts(
           tx,
           company,
           original,
-          this.postingLines(original),
+          (frozen) => this.postingLines(original, frozen, itemAccounts),
         );
         const credits = sum(
           original.memos
@@ -975,11 +1108,29 @@ export class FinanceService implements OnModuleDestroy {
           priorAmount.add(amount).mul(original.taxAmount).div(original.total),
         ).minus(priorTax);
         const subtotal = amount.minus(taxAmount);
+        const payable = original.direction === 'AP';
+        const itemRevenueCodes = Object.values(itemAccounts).flatMap((item) =>
+          item['4000'] ? [item['4000']] : [],
+        );
+        const splitRevenue =
+          !payable &&
+          !original.subtotal.isZero() &&
+          itemRevenueCodes.length > 0;
+        const replacedCode = payable
+          ? '5000'
+          : splitRevenue
+            ? '4000'
+            : undefined;
         let accountAllocations: { code: string; amount: string }[] = [];
-        if (original.direction === 'AP') {
-          const base = this.documentLines(original).filter(
-            (line) => !['2100', '1400'].includes(line.code),
-          );
+        if (replacedCode) {
+          const revenueCodes = new Set([accounts['4000'], ...itemRevenueCodes]);
+          const base = payable
+            ? this.documentLines(original).filter(
+                (line) => !['2100', '1400'].includes(line.code),
+              )
+            : originalLines
+                .filter((line) => revenueCodes.has(line.code))
+                .map((line) => ({ code: line.code, debit: line.credit }));
           const cumulative = allocateMemoAccounts(
             sum(earlier.map((memo) => memo.subtotal)).add(subtotal),
             base,
@@ -992,6 +1143,7 @@ export class FinanceService implements OnModuleDestroy {
                   const row = v.object(line);
                   return {
                     code: id(row.code),
+                    // Cumulative rounding can move a cent between accounts.
                     amount: money(
                       row.amount,
                       'Stored allocation',
@@ -1052,20 +1204,26 @@ export class FinanceService implements OnModuleDestroy {
             postedAt: new Date(),
           },
         });
-        // AP memos reverse the original expense/capitalization account proportions.
-        let lines = this.documentLines(record, kind === 'CREDIT_MEMO');
-        if (original.direction === 'AP') {
-          lines = lines.filter((line) => line.code !== '5000');
+        const reverse = kind === 'CREDIT_MEMO';
+        const lines = mappedLines(
+          this.documentLines(record, reverse).filter(
+            (line) => line.code !== replacedCode,
+          ),
+          accounts,
+        );
+        // The original bill allocations use semantic roles. The invoice revenue
+        // allocations already have the account codes saved on its source posting.
+        for (const share of accountAllocations) {
+          const allocated = new Prisma.Decimal(share.amount);
+          const code = payable
+            ? (accounts[share.code] ?? share.code)
+            : share.code;
           lines.push(
-            ...accountAllocations.map((share) => {
-              const amount = new Prisma.Decimal(share.amount);
-              const debit = (kind !== 'CREDIT_MEMO') !== amount.isNegative();
-              return {
-                code: share.code,
-                debit: debit ? amount.abs().toFixed(2) : '0.00',
-                credit: debit ? '0.00' : amount.abs().toFixed(2),
-              };
-            }),
+            journalPostingLine(
+              code,
+              allocated.abs(),
+              (payable !== reverse) !== allocated.isNegative(),
+            ),
           );
         }
         await postJournal(tx, company, actor, {
@@ -1075,7 +1233,7 @@ export class FinanceService implements OnModuleDestroy {
           date: record.issueDate,
           memo: `${record.number}: ${reason}`,
           approvalAmount: amount.toFixed(2),
-          lines: mappedLines(lines, accounts),
+          lines,
         });
         await audit(
           tx,
@@ -1227,11 +1385,11 @@ export class FinanceService implements OnModuleDestroy {
       const controls = new Map<string, Prisma.Decimal>();
       for (const line of allocations) {
         const document = documents.find((row) => row.id === line.documentId)!;
-        const original = await sourcePostingAccounts(
+        const { accounts: original } = await sourcePostingAccounts(
           tx,
           company,
           document,
-          this.postingLines(document),
+          (frozen) => this.postingLines(document, frozen),
         );
         const code = original[direction === 'AR' ? '1300' : '2100'];
         controls.set(
