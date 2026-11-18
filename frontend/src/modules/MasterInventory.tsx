@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { ProductCostHistory } from './phase3/ProfilePanels';
+import { ProductCostHistory, ProductPostingAccounts } from './phase3/ProfilePanels';
 import * as XLSX from 'xlsx';
 import { getApiAuthHeaders, expireApiSession } from '../lib/apiSession';
 import './catalog-customer-workspace.css';
@@ -83,7 +83,7 @@ let globalImageVault: Record<string, string> = {};
 let currentValidImages: Record<string, string> = {};
 let deletedImageVault: Record<string, string> = {}; 
 
-export default function MasterInventory({ selectedCompany, loginUsername, API_BASE_URL, onLogout, onBack, canFinance = false }: any) {
+export default function MasterInventory({ selectedCompany, loginUsername, API_BASE_URL, onLogout, onBack, canFinance = false, canViewPostingAccounts = false, canEditPostingAccounts = false }: any) {
   const [costHistoryProduct, setCostHistoryProduct] = useState<Product | null>(null);
   const isAuthorizedAdmin = loginUsername?.toLowerCase() === 'admin' || loginUsername?.toLowerCase() === 'ali' || loginUsername?.toLowerCase() === 'super admin';
 
@@ -1597,6 +1597,15 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
               
               <button type="submit" disabled={isProcessing} className="py-4 bg-slate-900 text-white rounded-xl font-black uppercase tracking-wider hover:bg-slate-800 transition-colors shadow-md disabled:opacity-50 mt-4">Save Master Record</button>
             </form>
+            {canViewPostingAccounts && productModal.editingId !== null && (
+              <ProductPostingAccounts
+                key={JSON.stringify([selectedCompany, productModal.editingId])}
+                api={API_BASE_URL}
+                company={selectedCompany}
+                productId={productModal.editingId}
+                canWrite={canEditPostingAccounts}
+              />
+            )}
           </div>
         </div>
       )}

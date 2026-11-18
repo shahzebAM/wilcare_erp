@@ -178,11 +178,12 @@ export function usePhase3Data<T>(
     })();
     return () => controller.abort();
   }, [api, company, path, revision, enabled]);
-  const run = async (
+  const run = async <Result = unknown>(
     endpoint: string,
     body: unknown,
     message: string,
     method: 'POST' | 'DELETE' = 'POST',
+    onSuccess?: (result: Result) => void,
   ): Promise<boolean> => {
     if (writing.current) return false;
     writing.current = true;
@@ -190,8 +191,9 @@ export function usePhase3Data<T>(
     setError('');
     setNotice('');
     try {
-      await phase3Request(api, company, endpoint, body, undefined, method);
+      const result = await phase3Request<Result>(api, company, endpoint, body, undefined, method);
       if (alive.current) {
+        onSuccess?.(result);
         setNotice(message);
         refresh();
       }

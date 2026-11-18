@@ -462,7 +462,18 @@ const [activeModule, setActiveModule] = useState<'none' | 'payroll' | 'ai_docs' 
   if (['finance', 'books', 'service', 'executive', 'ai_assistant'].includes(activeModule)) return <Suspense fallback={<p role="status" className="p-8 text-slate-600">Loading workspace…</p>}><Phase3Module key={`${selectedCompany}-${activeModule}-${currentUser?.role}-${JSON.stringify(currentUser?.modules)}`} selectedCompany={selectedCompany!} API_BASE_URL={API_BASE_URL} currentUser={currentUser} view={activeModule as Phase3View} initialDeliveryId={invoiceDeliveryId} onOpenFinance={globalModules.finance !== false && hasPhase3Access(currentUser, selectedCompany, 'finance') ? () => setActiveModule('finance') : undefined} onBack={() => { setInvoiceDeliveryId(undefined); setActiveModule('none'); }} /></Suspense>;
   if (activeModule === 'customers') return <CustomerModule selectedCompany={selectedCompany!} loginUsername={loginUsername} API_BASE_URL={API_BASE_URL} canFinance={globalModules.finance !== false && hasPhase3Access(currentUser, selectedCompany, 'finance')} onBack={() => setActiveModule('none')} onRouteToOrderSlip={(id: string) => { setTargetCustomerId(id); setActiveModule('create_os'); }} />;
   if (activeModule === 'create_os') return <CreateOSModule selectedCompany={selectedCompany!} loginUsername={loginUsername} API_BASE_URL={API_BASE_URL} initialCustomerId={targetCustomerId} onBack={() => { setActiveModule('none'); setTargetCustomerId(null); }} onViewLedger={() => setActiveModule('sales_orders')} canApprove={canApproveFulfillment} onOpenFulfillment={() => setActiveModule('deliveries')} />;
-  if (activeModule === 'products' || activeModule === 'inventory' || activeModule === 'warehouses') return <MasterInventory selectedCompany={selectedCompany!} loginUsername={loginUsername} API_BASE_URL={API_BASE_URL} canFinance={globalModules.finance !== false && hasPhase3Access(currentUser, selectedCompany, 'landed')} onLogout={handleLogout} onBack={() => setActiveModule('none')} />;
+  if (activeModule === 'products' || activeModule === 'inventory' || activeModule === 'warehouses') return (
+    <MasterInventory
+      selectedCompany={selectedCompany!}
+      loginUsername={loginUsername}
+      API_BASE_URL={API_BASE_URL}
+      canFinance={globalModules.finance !== false && hasPhase3Access(currentUser, selectedCompany, 'landed')}
+      canViewPostingAccounts={globalModules.books !== false && hasPhase3Access(currentUser, selectedCompany, 'books')}
+      canEditPostingAccounts={globalModules.books !== false && hasPhase3Access(currentUser, selectedCompany, 'books', true)}
+      onLogout={handleLogout}
+      onBack={() => setActiveModule('none')}
+    />
+  );
   if (activeModule === 'ai_docs') return <AiDocsModule selectedCompany={selectedCompany!} loginUsername={loginUsername} API_BASE_URL={API_BASE_URL} onBack={() => setActiveModule('none')} />;
   if (activeModule === 'payroll') return <PayrollModule selectedCompany={selectedCompany!} loginUsername={loginUsername} API_BASE_URL={API_BASE_URL} onLogout={handleLogout} onBack={() => setActiveModule('none')} />;
   if (activeModule === 'sales_orders') return <OrderSlipsModule selectedCompany={selectedCompany!} loginUsername={loginUsername} API_BASE_URL={API_BASE_URL} onBack={() => setActiveModule('none')} onCreateNew={() => setActiveModule('create_os')} canApprove={canApproveFulfillment} onOpenFulfillment={() => setActiveModule('deliveries')} />;

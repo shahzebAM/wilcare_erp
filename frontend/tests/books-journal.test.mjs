@@ -9,7 +9,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 const require = createRequire(import.meta.url);
 const source = (name) => readFileSync(new URL(`../src/modules/phase3/${name}`, import.meta.url), 'utf8');
 
-function load(name, dependencies = {}) {
+function load(name, dependencies = {}, globals = {}) {
   const exports = {};
   const code = ts.transpileModule(source(name), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
@@ -22,6 +22,7 @@ function load(name, dependencies = {}) {
     URL,
     AbortSignal,
     console,
+    ...globals,
   });
   return exports;
 }
@@ -42,11 +43,16 @@ const sampleLines = () => [
   { code: '1000', debit: '', credit: '402.00', memo: 'Petty cash reimbursement' },
 ];
 
-function workspace({ lines = sampleLines(), journals = [], canWrite = true, busy = false } = {}) {
+function workspace({ lines = sampleLines(), journals = [], canWrite = true, busy = false, savedLayout, postResults = [] } = {}) {
   const values = [];
   const calls = [];
+  const storage = { getItem: () => savedLayout, setItem: (key, value) => { savedLayout = value; storage.key = key; } };
   let cursor = 0;
   const react = {
+    useRef(initial) {
+      const slot = cursor++;
+      return values[slot] ??= { current: initial };
+    },
     useState(initial) {
       const slot = cursor++;
       if (!(slot in values)) {
@@ -64,20 +70,28 @@ function workspace({ lines = sampleLines(), journals = [], canWrite = true, busy
     './FinancialReports': reports,
     './CashFlowWorkspace': {},
     './InventoryReconciliation': {},
+    './AuditLog': {},
+    './journalExport': {},
     './api': {
       ...api,
       formValue: (form, key) => String(form[key] ?? '').trim(),
       usePhase3Data: () => ({
         data, loading: false, busy, refresh: () => {},
-        run: async (...args) => { calls.push(args); return true; },
+        run: async (...args) => {
+          calls.push(args);
+          const result = postResults.shift();
+          if (result === false) return false;
+          if (result) args[4]?.(result);
+          return true;
+        },
       }),
     },
-  });
+  }, { crypto, localStorage: storage });
   const tree = () => {
     cursor = 0;
     return component.default({ api: 'http://test', company: 'Test', canWrite, canManageAccounts: false });
   };
-  return { tree, html: () => renderToStaticMarkup(tree()), calls };
+  return { tree, html: () => renderToStaticMarkup(tree()), calls, storage };
 }
 
 function find(tree, predicate) {
@@ -174,16 +188,92 @@ test('one journal submission carries distinct line memos even when account codes
   const ui = workspace();
   const form = find(ui.tree(), (node) => node.type === shared.Form && node.props.title === 'Post manual journal');
   assert.ok(form);
-  await form.props.onSubmit({ date: '2026-11-12', memo: 'Office expenses', reference: 'TEST-JOURNAL-1' });
+  let resets = 0;
+  await form.props.onSubmit({ date: '2026-11-12', memo: 'Office expenses', reset: () => resets++ });
   assert.equal(ui.calls.length, 1);
   const [path, body] = ui.calls[0];
   assert.equal(path, '/books/journals');
   assert.equal(body.memo, 'Office expenses');
+  assert.match(body.submissionKey, /^[0-9a-f-]{36}$/);
+  assert.equal(body.reference, undefined);
+  assert.equal(resets, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(body.lines)), [
     { code: '5000', debit: '250.00', credit: '0', memo: 'Snacks <and> tea' },
     { code: '5000', debit: '152.00', credit: '0', memo: 'Delivery' },
     { code: '1000', debit: '0', credit: '402.00', memo: 'Petty cash reimbursement' },
   ]);
+});
+
+test('a failed post can be replayed and an older returned journal is immediately available', async () => {
+  const posted = { id: 'backdated', number: 'JRN-01-01/02/2020', date: '2020-01-02', memo: 'Office expenses', entries: [] };
+  const ui = workspace({ postResults: [false, posted] });
+  const form = () => find(ui.tree(), (node) => node.type === shared.Form && node.props.title === 'Post manual journal');
+  let resets = 0;
+  const details = { date: '2020-01-02', memo: 'Office expenses', reset: () => resets++ };
+  await form().props.onSubmit(details);
+  assert.equal(resets, 0);
+  assert.match(ui.html(), /Snacks &lt;and&gt; tea/);
+  await form().props.onSubmit(details);
+  assert.equal(resets, 1);
+  assert.equal(ui.calls[0][1].submissionKey, ui.calls[1][1].submissionKey);
+  assert.match(ui.html(), /JRN-01-01\/02\/2020 · Office expenses/);
+  assert.match(ui.html(), /Download Excel/);
+  assert.match(ui.html(), /Print journal/);
+});
+
+test('accounting sections move in either direction and survive reopening with a saved order', () => {
+  const ui = workspace({ savedLayout: '["history", "history", "obsolete"]' });
+  const sections = ['Chart of accounts', 'Balanced journal entries', 'General ledger · journal history', 'Trial balance'];
+  const sectionOrder = () => {
+    const html = ui.html();
+    return [...sections].sort((a, b) => html.indexOf(`>${a}</h2>`) - html.indexOf(`>${b}</h2>`));
+  };
+  assert.deepEqual(sectionOrder(), [sections[2], sections[0], sections[1], sections[3]]);
+  find(ui.tree(), (node) => node.type === 'button' && node.props.children === 'Edit layout').props.onClick();
+  assert.equal(control(ui, `Move ${sections[2]} up`).props.disabled, true);
+  control(ui, `Move ${sections[1]} up`).props.onClick();
+  control(ui, `Move ${sections[2]} down`).props.onClick();
+  assert.deepEqual(sectionOrder(), [sections[1], sections[2], sections[0], sections[3]]);
+  assert.match(ui.storage.key, /books-layout:v1/);
+  const reopened = workspace({ savedLayout: ui.storage.getItem() });
+  assert.ok(reopened.html().indexOf(`>${sections[1]}</h2>`) < reopened.html().indexOf(`>${sections[2]}</h2>`));
+  assert.match(ui.html(), /Snacks &lt;and&gt; tea/);
+});
+
+test('journal download and print preserve the reference, escaped text and exact totals', () => {
+  const exports = [];
+  const xlsx = { ...require('xlsx'), writeFile: (...args) => exports.push(args) };
+  let html = '';
+  let printed = false;
+  const printWindow = {
+    document: { open() {}, write: (markup) => { html = markup; }, close() {} },
+    focus() {}, print: () => { printed = true; },
+  };
+  const output = load('journalExport.ts', { xlsx, './api': api }, { window: { open: () => printWindow } });
+  const journal = {
+    number: 'JRN-01-11/12/2026', date: '2026-11-12', memo: 'Office <expenses> & supplies',
+    entries: [
+      { account: '5000 Expense', debit: '9999999999999999.98', credit: '0', memo: '=1+1' },
+      { account: '5000 Expense', debit: '0.01', credit: '0.00', memo: 'One cent' },
+      { account: '1000 Cash', debit: '0', credit: '9999999999999999.99', memo: '<script>throw 1</script>' },
+    ],
+  };
+  output.downloadJournal('Test', journal);
+  const [{ Sheets }, filename] = exports[0];
+  assert.equal(filename, 'JRN-01-11-12-2026.xlsx');
+  assert.equal(Sheets.Journal.B2.v, journal.number);
+  assert.equal(Sheets.Journal.D7.t, 's');
+  assert.equal(Sheets.Journal.D7.v, '=1+1');
+  assert.equal(Sheets.Journal.B10.v, '9999999999999999.99');
+  assert.equal(Sheets.Journal.C10.v, '9999999999999999.99');
+  output.printJournal('Test', journal);
+  assert.equal(printed, true);
+  assert.equal(printWindow.opener, null);
+  assert.match(html, /Office &lt;expenses&gt; &amp; supplies/);
+  assert.match(html, /<tfoot>.*9999999999999999\.99.*9999999999999999\.99/);
+  assert.doesNotMatch(html, /<script>/);
+  const blocked = load('journalExport.ts', { xlsx, './api': api }, { window: { open: () => null } });
+  assert.throws(() => blocked.printJournal('Test', journal), /Allow pop-ups/);
 });
 
 test('saved journal and history show entry memo with legacy journal-description fallback', () => {

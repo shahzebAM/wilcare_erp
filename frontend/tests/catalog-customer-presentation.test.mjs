@@ -4,11 +4,11 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 
-// Preserve the pre-redesign code, including all handlers, request payloads,
+// Preserve the catalog code, including all handlers, request payloads,
 // financial expressions, pagination, badges and data-bound JSX. Only CSS and
 // the accessibility attributes added to the existing controls are excluded.
 const baseline = {
-  MasterInventory: 'f5fe6db7b927c49d50e5592d1e470fa0216d121ab7af355b97599b5d855823d4',
+  MasterInventory: 'a773043a026cae7d3584e81e541f0b289cf1bf6820f6e618ab1f330c6f978b04',
   CustomerModule: 'a72d82d658f827cf080b81683a0c30f5a45f21ecb708da1d5ffd862b596665c7',
 };
 

@@ -39,7 +39,7 @@ export default function Phase3Module({
 }: {
   selectedCompany: string;
   API_BASE_URL: string;
-  currentUser?: ErpUser;
+  currentUser?: ErpUser & { username?: string };
   view: Phase3View;
   onBack: () => void;
   initialDeliveryId?: string;
@@ -89,8 +89,10 @@ export default function Phase3Module({
           />
         ) : view === 'books' ? (
           <BooksWorkspace
+            key={JSON.stringify([selectedCompany, currentUser?.username])}
             api={API_BASE_URL}
             company={selectedCompany}
+            layoutUser={currentUser?.username}
             canReconcileInventory={hasPhase3Access(currentUser, selectedCompany, 'finance')}
             canManageAccounts={canManageLedgerAccounts(
               currentUser,

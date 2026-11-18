@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import * as XLSX from "xlsx";
 import { DataTable, Field, Form, Notice, Panel, PartySelect } from "./shared";
 import {
@@ -12,7 +12,6 @@ import {
   phase3Request,
   primary,
   secondary,
-  textValue,
   today,
   usePhase3Data,
 } from "./api";
@@ -20,6 +19,8 @@ import type { JsonRow } from "./api";
 import FinancialReports, { ReportMoney } from "./FinancialReports";
 import CashFlowWorkspace from "./CashFlowWorkspace";
 import InventoryReconciliation from "./InventoryReconciliation";
+import { downloadJournal, printJournal } from "./journalExport";
+import AuditLog from "./AuditLog";
 
 type Account = {
   id: string;
@@ -81,6 +82,31 @@ type ImportedLine = {
   description: string;
   amount: string;
 };
+
+const ledgerSections = {
+  accounts: "Chart of accounts",
+  journals: "Balanced journal entries",
+  history: "General ledger · journal history",
+  balance: "Trial balance",
+};
+const defaultLedgerOrder = Object.keys(ledgerSections);
+const initialJournalLines = [
+  { code: "1000", debit: "", credit: "", memo: "" },
+  { code: "3000", debit: "", credit: "", memo: "" },
+];
+
+function savedLedgerOrder(storageKey: string): string[] {
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(storageKey) ?? "null");
+    if (Array.isArray(saved)) {
+      const known = saved.filter((id): id is string => defaultLedgerOrder.includes(id));
+      return [...new Set([...known, ...defaultLedgerOrder])];
+    }
+  } catch {
+    // The layout can still be rearranged when browser storage is unavailable.
+  }
+  return defaultLedgerOrder;
+}
 
 function ReconciliationForm({
   accounts,
@@ -273,12 +299,14 @@ function ReconciliationForm({
 export default function BooksWorkspace({
   api,
   company,
+  layoutUser = "",
   canWrite,
   canManageAccounts,
   canReconcileInventory = false,
 }: {
   api: string;
   company: string;
+  layoutUser?: string;
   canWrite: boolean;
   canManageAccounts: boolean;
   canReconcileInventory?: boolean;
@@ -295,19 +323,36 @@ export default function BooksWorkspace({
   );
   const [loadingBank, setLoadingBank] = useState("");
   const [bankError, setBankError] = useState("");
-  const [lines, setLines] = useState([
-    { code: "1000", debit: "", credit: "", memo: "" },
-    { code: "3000", debit: "", credit: "", memo: "" },
-  ]);
+  const [lines, setLines] = useState(initialJournalLines);
+  const journalSubmission = useRef<{ signature: string; key: string } | null>(null);
+  const [latestJournal, setLatestJournal] = useState<Journal | null>(null);
+  const [journalOutputError, setJournalOutputError] = useState<{ id: string; message: string } | null>(null);
+  const layoutStorageKey = `wilcare:books-layout:v1:${JSON.stringify([company, layoutUser])}`;
+  const [ledgerOrder, setLedgerOrder] = useState(() => savedLedgerOrder(layoutStorageKey));
+  const [editingLayout, setEditingLayout] = useState(false);
   const [selectedMatches, setSelectedMatches] = useState<
     Record<string, string>
   >({});
-  const [audit, setAudit] = useState<JsonRow[]>([]);
-  const [auditError, setAuditError] = useState("");
   const data = state.data;
   const activeAccounts = (data?.accounts || []).filter((account) => account.active !== false);
   const archivedAccounts = (data?.accounts || []).filter((account) => account.active === false);
   const totals = journalTotals(lines);
+  const moveSection = (index: number, direction: -1 | 1) => {
+    const position = index + direction;
+    if (position < 0 || position >= ledgerOrder.length) return;
+    const next = [...ledgerOrder];
+    [next[index], next[position]] = [next[position], next[index]];
+    setLedgerOrder(next);
+    try {
+      localStorage.setItem(layoutStorageKey, JSON.stringify(next));
+    } catch {
+      // The layout remains available for the current visit.
+    }
+  };
+  const journals = data?.journals ?? [];
+  const displayedJournals = latestJournal && !journals.some(({ id }) => id === latestJournal.id)
+    ? [latestJournal, ...journals]
+    : journals;
   const entries = (data?.journals || []).flatMap((journal) =>
     journal.entries.map((entry) => ({
       ...entry,
@@ -341,13 +386,13 @@ export default function BooksWorkspace({
             {title}
           </button>
         ))}
-        <button
+        {tab !== "audit" && <button
           className={`${secondary} ml-auto`}
           disabled={state.loading || state.busy}
           onClick={state.refresh}
         >
           Refresh
-        </button>
+        </button>}
       </div>
       <Notice {...state} />
       {tab === "reports" && <FinancialReports api={api} company={company} />}
@@ -355,8 +400,33 @@ export default function BooksWorkspace({
       {tab === "inventory-reconciliation" && canReconcileInventory && <InventoryReconciliation api={api} company={company} />}
       {data && tab === "ledger" && (
         <>
+          <div className="flex justify-end">
+            <button type="button" className={secondary} aria-expanded={editingLayout} onClick={() => setEditingLayout(!editingLayout)}>
+              {editingLayout ? "Done arranging" : "Edit layout"}
+            </button>
+          </div>
+          {editingLayout && (
+            <Panel title="Arrange account and journal sections">
+              <ol className="space-y-2">
+                {ledgerOrder.map((id, index) => {
+                  const title = ledgerSections[id as keyof typeof ledgerSections];
+                  return (
+                    <li key={id} className="flex flex-wrap items-center justify-between gap-2">
+                      <span>{title}</span>
+                      <div className="flex gap-2">
+                        <button type="button" className={secondary} aria-label={`Move ${title} up`} disabled={index === 0} onClick={() => moveSection(index, -1)}>Move up</button>
+                        <button type="button" className={secondary} aria-label={`Move ${title} down`} disabled={index === ledgerOrder.length - 1} onClick={() => moveSection(index, 1)}>Move down</button>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ol>
+            </Panel>
+          )}
+          {[
           <Panel
-            title="Chart of accounts"
+            key="accounts"
+            title={ledgerSections.accounts}
             actions={
               canWrite && (
                 <button
@@ -482,28 +552,39 @@ export default function BooksWorkspace({
                 </Form>
               </div>
             )}
-          </Panel>
-          <Panel title="Balanced journal entries">
+          </Panel>,
+          <Panel key="journals" title={ledgerSections.journals}>
             {canWrite && (
               <Form
                 title="Post manual journal"
                 disabled={state.busy}
                 button="Post balanced journal"
                 onSubmit={async (form) => {
-                  await state.run(
+                  const details = {
+                    date: formValue(form, "date"),
+                    memo: formValue(form, "memo"),
+                    lines: lines.map((line) => ({
+                      ...line,
+                      debit: line.debit || "0",
+                      credit: line.credit || "0",
+                    })),
+                  };
+                  const signature = JSON.stringify(details);
+                  if (journalSubmission.current?.signature !== signature) {
+                    journalSubmission.current = { signature, key: crypto.randomUUID() };
+                  }
+                  const ok = await state.run<Journal>(
                     "/books/journals",
-                    {
-                      date: formValue(form, "date"),
-                      memo: formValue(form, "memo"),
-                      reference: formValue(form, "reference"),
-                      lines: lines.map((line) => ({
-                        ...line,
-                        debit: line.debit || "0",
-                        credit: line.credit || "0",
-                      })),
-                    },
+                    { ...details, submissionKey: journalSubmission.current.key },
                     "Balanced journal posted.",
+                    "POST",
+                    setLatestJournal,
                   );
+                  if (ok) {
+                    journalSubmission.current = null;
+                    form.reset();
+                    setLines(initialJournalLines);
+                  }
                 }}
               >
                 <div className="grid gap-4 md:grid-cols-3">
@@ -519,9 +600,10 @@ export default function BooksWorkspace({
                   <Field label="Journal description">
                     <input required name="memo" maxLength={2000} className={input} />
                   </Field>
-                  <Field label="Unique journal reference">
-                    <input required name="reference" className={input} />
-                  </Field>
+                  <div className="text-sm text-slate-600">
+                    <p className="font-medium">Journal reference</p>
+                    <p className="mt-2">Assigned when posted (JRN-01-MM/DD/YYYY)</p>
+                  </div>
                 </div>
                 <p className="text-xs text-slate-600">
                   Enter a memo for each entry. The journal description is used when a line memo is blank.
@@ -650,27 +732,44 @@ export default function BooksWorkspace({
               </Form>
             )}
             <div className="mt-5 space-y-3">
-              {data.journals.map((journal) => (
-                <details key={journal.id} className="rounded-lg border p-3">
-                  <summary className="cursor-pointer text-sm font-semibold">
-                    {journal.number} · {date(journal.date)} · {journal.memo}
-                  </summary>
-                  <DataTable
-                    rows={journal.entries.map((entry) => ({
-                      ...entry,
-                      account: `${entry.account?.code || ""} ${entry.account?.name || entry.accountId}`,
-                      memo: entry.memo ?? journal.memo,
-                    }))}
-                    columns={["account", "debit", "credit", "memo"]}
-                  />
-                </details>
-              ))}
-              {!data.journals.length && (
+              {displayedJournals.map((journal) => {
+                const rows = journal.entries.map((entry) => ({
+                  ...entry,
+                  account: `${entry.account?.code || ""} ${entry.account?.name || entry.accountId}`.trim(),
+                  memo: entry.memo ?? journal.memo,
+                }));
+                const output = (action: typeof printJournal) => {
+                  setJournalOutputError(null);
+                  try {
+                    action(company, { ...journal, entries: rows });
+                  } catch (reason) {
+                    setJournalOutputError({
+                      id: journal.id,
+                      message: reason instanceof Error ? reason.message : "Could not prepare the journal.",
+                    });
+                  }
+                };
+                const dateInReference = /^JRN-\d{2,}-\d{2}\/\d{2}\/\d{4}$/.test(journal.number);
+                return (
+                  <details key={journal.id} className="rounded-lg border p-3">
+                    <summary className="cursor-pointer text-sm font-semibold">
+                      {journal.number}{dateInReference ? "" : ` · ${date(journal.date)}`} · {journal.memo}
+                    </summary>
+                    <div className="my-3 flex flex-wrap gap-2">
+                      <button type="button" className={secondary} onClick={() => output(downloadJournal)}>Download Excel</button>
+                      <button type="button" className={secondary} onClick={() => output(printJournal)}>Print journal</button>
+                    </div>
+                    {journalOutputError?.id === journal.id && <Notice error={journalOutputError.message} />}
+                    <DataTable rows={rows} columns={["account", "debit", "credit", "memo"]} />
+                  </details>
+                );
+              })}
+              {!displayedJournals.length && (
                 <p className="text-sm text-slate-500">No journals posted.</p>
               )}
             </div>
-          </Panel>
-          <Panel title="General ledger · journal history">
+          </Panel>,
+          <Panel key="history" title={ledgerSections.history}>
             <p className="mb-4 text-xs text-slate-500">
               Entries from the journal history currently loaded in this workspace.
             </p>
@@ -683,8 +782,8 @@ export default function BooksWorkspace({
               columns={["date", "journal", "account", "memo", "debit", "credit"]}
               searchLabel="Search journal entries"
             />
-          </Panel>
-          <Panel title="Trial balance">
+          </Panel>,
+          <Panel key="balance" title={ledgerSections.balance}>
             <DataTable
               rows={
                 asRows(data.trialBalance).length
@@ -693,15 +792,17 @@ export default function BooksWorkspace({
               }
               columns={["code", "name", "debit", "credit", "balance"]}
             />
-          </Panel>
+          </Panel>,
+          ].sort((first, second) => ledgerOrder.indexOf(String(first.key)) - ledgerOrder.indexOf(String(second.key)))}
         </>
       )}
       {data && tab === "mapping" && (
         <Panel title="Posting roles and reference mappings">
           <p className="mb-4 text-sm text-slate-500">
-            POSTING_ROLE controls the accounts used by new automatic Finance postings.
-            Payments and memos retain their original source accounts. ITEM, CUSTOMER,
-            SUPPLIER and ACCOUNT links remain references; manual journals use the accounts you select.
+            Posting roles set the company defaults. Products can override sales income,
+            cost of goods sold and inventory accounts for new sales invoices in the product editor.
+            Payments and memos use their original source accounts. Manual journals use the accounts you select.
+            ITEM, CUSTOMER, SUPPLIER and ACCOUNT links are for reference.
           </p>
           {canWrite && (
             <Form
@@ -983,58 +1084,7 @@ export default function BooksWorkspace({
         </>
       )}
       {tab === "audit" && (
-        <Panel
-          title="Immutable ERP audit log"
-          actions={
-            <button
-              className={secondary}
-              disabled={state.busy}
-              onClick={async () => {
-                setAuditError("");
-                try {
-                  const result = await phase3Request<unknown>(
-                    api,
-                    company,
-                    "/audit?limit=100",
-                  );
-                  setAudit(
-                    Array.isArray(result)
-                      ? asRows(result)
-                      : asRows(
-                          asObject(result).records ||
-                            asObject(result).items ||
-                            asObject(result).rows,
-                        ),
-                  );
-                } catch (reason) {
-                  setAuditError(
-                    reason instanceof Error
-                      ? reason.message
-                      : "Could not load audit log.",
-                  );
-                }
-              }}
-            >
-              Load latest 100 events
-            </button>
-          }
-        >
-          <Notice error={auditError} />
-          <DataTable
-            rows={audit.map((row) => ({
-              ...row,
-              details: textValue(row.details),
-            }))}
-            columns={[
-              "createdAt",
-              "actor",
-              "action",
-              "entityType",
-              "entityId",
-              "details",
-            ]}
-          />
-        </Panel>
+        <AuditLog key={company} api={api} company={company} />
       )}
     </div>
   );

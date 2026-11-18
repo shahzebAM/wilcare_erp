@@ -106,3 +106,80 @@ test('demand chart shows server projection values and leaves the source report i
   assert.match(html, /Planning estimate|planning estimate/);
   assert.deepEqual(executive, before);
 });
+
+function productPostingForm(canWrite) {
+  const path = '/books/products/17/posting-accounts';
+  const requests = [];
+  const writes = [];
+  let selection;
+  const react = { useState: (initial) => [selection ?? initial, (value) => { selection = value; }] };
+  const api = load('api.ts', { react, '../../lib/apiSession': {} });
+  const shared = load('shared.tsx', { react, './api': api });
+  const { ProductPostingAccounts } = load('ProfilePanels.tsx', {
+    react,
+    './shared': shared,
+    './api': {
+      ...api,
+      usePhase3Data(...args) {
+        requests.push(args);
+        return {
+          data: {
+            accounts: [
+              { id: 'revenue', type: 'REVENUE', code: '4001', name: 'Custom sales income', active: true },
+              { id: 'expense', type: 'EXPENSE', code: '5101', name: 'Custom cost of goods sold', active: true },
+              { id: 'asset', type: 'ASSET', code: '1301', name: 'Custom inventory', active: true },
+              { id: 'archived', type: 'ASSET', code: '1302', name: 'Legacy inventory', active: false },
+              { id: 'cash', type: 'ASSET', code: '1000', name: 'Protected cash', active: true, eligible: false },
+            ],
+            selections: { salesAccountId: null, cogsAccountId: null, inventoryAccountId: 'archived' },
+          },
+          run: async (...args) => { writes.push(args); return true; },
+        };
+      },
+    },
+  });
+  const tree = () => ProductPostingAccounts({ api: 'http://test', company: 'Wilcare', productId: 17, canWrite });
+  const form = () => {
+    const element = tree().props.children.find((child) => child?.props?.settings);
+    return element.type(element.props);
+  };
+  const select = (label) => form().props.children[0].props.children.find(
+    (field) => field.props.label === label,
+  ).props.children;
+  const submit = () => form().props.onSubmit({ preventDefault() {} });
+  return { tree, form, select, submit, writes, requests, path };
+}
+
+test('product posting accounts offer company defaults and only the matching active account types', () => {
+  const ui = productPostingForm(true);
+  const revenue = ui.select('Sales income account');
+  const expense = ui.select('Cost of goods sold account');
+  const asset = ui.select('Inventory asset account');
+  assert.deepEqual(ui.requests.at(-1), ['http://test', 'Wilcare', ui.path]);
+  assert.match(renderToStaticMarkup(revenue), /Use company default/);
+  assert.match(renderToStaticMarkup(revenue), /4001 · Custom sales income/);
+  assert.doesNotMatch(renderToStaticMarkup(revenue), /Custom cost of goods sold|Custom inventory/);
+  assert.match(renderToStaticMarkup(expense), /5101 · Custom cost of goods sold/);
+  assert.match(renderToStaticMarkup(asset), /disabled="" selected="">1302 · Legacy inventory \(archived\)/);
+  assert.doesNotMatch(renderToStaticMarkup(asset), /Protected cash/);
+  revenue.props.onChange({ target: { value: 'revenue' } });
+  ui.submit();
+  assert.equal(ui.writes.length, 0);
+  ui.select('Inventory asset account').props.onChange({ target: { value: '' } });
+  ui.submit();
+  assert.equal(ui.writes.length, 1);
+  assert.equal(ui.writes[0][0], ui.path);
+  assert.deepEqual(JSON.parse(JSON.stringify(ui.writes[0][1])), {
+    salesAccountId: 'revenue', cogsAccountId: null, inventoryAccountId: null,
+  });
+});
+
+test('read-only Books access displays the product accounts without a save action', () => {
+  const ui = productPostingForm(false);
+  const html = renderToStaticMarkup(ui.tree());
+  assert.match(html, /Sales income account/);
+  assert.match(html, /<fieldset disabled=""/);
+  assert.doesNotMatch(html, /Save posting accounts/);
+  ui.submit();
+  assert.equal(ui.writes.length, 0);
+});
