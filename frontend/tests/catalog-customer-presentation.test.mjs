@@ -8,7 +8,7 @@ import ts from 'typescript';
 // financial expressions, pagination, badges and data-bound JSX. Only CSS and
 // the accessibility attributes added to the existing controls are excluded.
 const baseline = {
-  MasterInventory: 'a773043a026cae7d3584e81e541f0b289cf1bf6820f6e618ab1f330c6f978b04',
+  MasterInventory: '046d22bfc621000e26da5b42617d4425c1bc2393690aa37cd3c2154cc3ad17c1',
   CustomerModule: 'a72d82d658f827cf080b81683a0c30f5a45f21ecb708da1d5ffd862b596665c7',
 };
 

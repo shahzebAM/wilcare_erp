@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { createElement, Fragment } from 'react';
 
 const require = createRequire(import.meta.url);
 const source = (name) => readFileSync(new URL(`../src/modules/phase3/${name}`, import.meta.url), 'utf8');
@@ -115,6 +116,16 @@ function productPostingForm(canWrite) {
   const react = { useState: (initial) => [selection ?? initial, (value) => { selection = value; }] };
   const api = load('api.ts', { react, '../../lib/apiSession': {} });
   const shared = load('shared.tsx', { react, './api': api });
+  const settings = {
+    accounts: [
+      { id: 'revenue', type: 'REVENUE', code: '4001', name: 'Custom sales income', active: true },
+      { id: 'expense', type: 'EXPENSE', code: '5101', name: 'Custom cost of goods sold', active: true },
+      { id: 'asset', type: 'ASSET', code: '1301', name: 'Custom inventory', active: true },
+      { id: 'archived', type: 'ASSET', code: '1302', name: 'Legacy inventory', active: false },
+      { id: 'cash', type: 'ASSET', code: '1000', name: 'Protected cash', active: true, eligible: false },
+    ],
+    selections: { salesAccountId: null, cogsAccountId: null, inventoryAccountId: 'archived' },
+  };
   const { ProductPostingAccounts } = load('ProfilePanels.tsx', {
     react,
     './shared': shared,
@@ -123,38 +134,27 @@ function productPostingForm(canWrite) {
       usePhase3Data(...args) {
         requests.push(args);
         return {
-          data: {
-            accounts: [
-              { id: 'revenue', type: 'REVENUE', code: '4001', name: 'Custom sales income', active: true },
-              { id: 'expense', type: 'EXPENSE', code: '5101', name: 'Custom cost of goods sold', active: true },
-              { id: 'asset', type: 'ASSET', code: '1301', name: 'Custom inventory', active: true },
-              { id: 'archived', type: 'ASSET', code: '1302', name: 'Legacy inventory', active: false },
-              { id: 'cash', type: 'ASSET', code: '1000', name: 'Protected cash', active: true, eligible: false },
-            ],
-            selections: { salesAccountId: null, cogsAccountId: null, inventoryAccountId: 'archived' },
-          },
+          data: settings,
           run: async (...args) => { writes.push(args); return true; },
         };
       },
     },
   });
-  const tree = () => ProductPostingAccounts({ api: 'http://test', company: 'Wilcare', productId: 17, canWrite });
-  const form = () => {
-    const element = tree().props.children.find((child) => child?.props?.settings);
-    return element.type(element.props);
+  const slots = () => ProductPostingAccounts({ api: 'http://test', company: 'Wilcare', productId: 17, canWrite, children: (fields) => fields });
+  const tree = () => createElement(Fragment, null, ...Object.values(slots()));
+  const select = (field) => slots()[field].props.children;
+  const submit = () => {
+    const button = slots().save;
+    if (button && !button.props.disabled) button.props.onClick();
   };
-  const select = (label) => form().props.children[0].props.children.find(
-    (field) => field.props.label === label,
-  ).props.children;
-  const submit = () => form().props.onSubmit({ preventDefault() {} });
-  return { tree, form, select, submit, writes, requests, path };
+  return { tree, slots, select, submit, writes, requests, path };
 }
 
 test('product posting accounts offer company defaults and only the matching active account types', () => {
   const ui = productPostingForm(true);
-  const revenue = ui.select('Sales income account');
-  const expense = ui.select('Cost of goods sold account');
-  const asset = ui.select('Inventory asset account');
+  const revenue = ui.select('salesAccount');
+  const expense = ui.select('cogsAccount');
+  const asset = ui.select('inventoryAccount');
   assert.deepEqual(ui.requests.at(-1), ['http://test', 'Wilcare', ui.path]);
   assert.match(renderToStaticMarkup(revenue), /Use company default/);
   assert.match(renderToStaticMarkup(revenue), /4001 · Custom sales income/);
@@ -165,7 +165,8 @@ test('product posting accounts offer company defaults and only the matching acti
   revenue.props.onChange({ target: { value: 'revenue' } });
   ui.submit();
   assert.equal(ui.writes.length, 0);
-  ui.select('Inventory asset account').props.onChange({ target: { value: '' } });
+  ui.select('inventoryAccount').props.onChange({ target: { value: '' } });
+  assert.equal(ui.slots().save.props.type, 'button');
   ui.submit();
   assert.equal(ui.writes.length, 1);
   assert.equal(ui.writes[0][0], ui.path);
@@ -178,7 +179,7 @@ test('read-only Books access displays the product accounts without a save action
   const ui = productPostingForm(false);
   const html = renderToStaticMarkup(ui.tree());
   assert.match(html, /Sales income account/);
-  assert.match(html, /<fieldset disabled=""/);
+  assert.equal(ui.select('salesAccount').props.disabled, true);
   assert.doesNotMatch(html, /Save posting accounts/);
   ui.submit();
   assert.equal(ui.writes.length, 0);

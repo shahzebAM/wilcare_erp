@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { ProductCostHistory, ProductPostingAccounts } from './phase3/ProfilePanels';
+import type { ProductPostingFields } from './phase3/ProfilePanels';
+import { money } from './phase3/api';
 import * as XLSX from 'xlsx';
 import { getApiAuthHeaders, expireApiSession } from '../lib/apiSession';
 import './catalog-customer-workspace.css';
@@ -24,6 +26,13 @@ interface Product {
   barcode: string; 
   currentStock: number; 
   cmdn?: string | null;
+  manufacturerPartNumber?: string | null;
+  purchaseDescription?: string | null;
+  salesDescription?: string | null;
+  preferredSupplierId?: string | null;
+  parentProductId?: number | null;
+  itemNotes?: string | null;
+  customFields?: Record<string, string> | null;
   createdAt: string; 
   deletedAt: string | null; 
 }
@@ -67,6 +76,15 @@ interface CustomerCategory {
   name: string; 
 }
 
+type SupplierOption = { id: string; legalName: string; tradeName?: string | null };
+type ItemCustomField = { name: string; value: string };
+
+function ItemField({ label, children, wide = false }: { label: string; children: React.ReactNode; wide?: boolean }) {
+  return <label className={`item-editor-field${wide ? ' item-editor-wide' : ''}`}><span>{label}</span>{children}</label>;
+}
+
+const itemPercent = new Intl.NumberFormat('en-PH', { style: 'percent', maximumFractionDigits: 2 });
+
 interface ImportReceipt {
   id: string;
   goodsReceiptId: string;
@@ -92,6 +110,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
   const [movements, setMovements] = useState<Movement[]>([]);
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [hubStock, setHubStock] = useState<WarehouseStock[]>([]);
+  const [warehouseStockAvailableFor, setWarehouseStockAvailableFor] = useState<string | null>(null);
   const [purchaseOrders, setPurchaseOrders] = useState<any[]>([]);
   const [importReceipts, setImportReceipts] = useState<ImportReceipt[]>([]);
   const [importReceivingError, setImportReceivingError] = useState('');
@@ -131,6 +150,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
   const [ledgerEndDate, setLedgerEndDate] = useState('');
 
   const [productModal, setProductModal] = useState<{ isOpen: boolean; editingId: number | null }>({ isOpen: false, editingId: null });
+  const [supplierOptions, setSupplierOptions] = useState<{ company: string; rows: SupplierOption[]; error: boolean } | null>(null);
   const [txModal, setTxModal] = useState<{ isOpen: boolean; products: Product[]; type: 'RECEIVE' | 'ISSUE' | 'ADJUST' | 'RETURN' }>({ isOpen: false, products: [], type: 'RECEIVE' });
   const [bulkPricingModal, setBulkPricingModal] = useState({ isOpen: false, tier: '', percentage: '' });
 
@@ -138,7 +158,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
   const [placementPo, setPlacementPo] = useState<any>(null);
   const [placementDestinations, setPlacementDestinations] = useState<Record<string, string>>({});
 
- const initialProductForm: any = { name: '', sku: '', cmdn: '', category: 'General', purchasePrice: '', sellingPrice: 0, categoryPrices: {}, minQuantity: 10, reorderLevel: 20, unit: 'pcs', isActive: true, vatSetting: 'Vatable', imageUrl: '', barcode: '', previousImageUrl: '', initialQuantity: 0, warehouseId: '', batchNumber: '', expirationDate: '' };
+ const initialProductForm: any = { name: '', sku: '', cmdn: '', category: 'General', purchasePrice: '', sellingPrice: 0, categoryPrices: {}, minQuantity: 10, reorderLevel: 20, unit: 'pcs', isActive: true, vatSetting: 'Vatable', imageUrl: '', barcode: '', previousImageUrl: '', initialQuantity: 0, warehouseId: '', batchNumber: '', expirationDate: '', manufacturerPartNumber: '', purchaseDescription: '', salesDescription: '', preferredSupplierId: '', parentProductId: '', itemNotes: '', customFields: [] };
   const [productForm, setProductForm] = useState(initialProductForm);
   const [txForm, setTxForm] = useState({ reference: '', remarks: '', batchNumber: '', expirationDate: '' });
   
@@ -157,6 +177,26 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
   const [isHubDropdownOpen, setIsHubDropdownOpen] = useState(false);
   const [expandedWarehouseId, setExpandedWarehouseId] = useState<string | null>(null);
   const [localAccordionSearch, setLocalAccordionSearch] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    if (!productModal.isOpen) return;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/products/supplier-options?company=${encodeURIComponent(selectedCompany)}`, {
+          headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany },
+          signal: controller.signal,
+        });
+        if (response.status === 401) expireApiSession();
+        if (!response.ok) throw new Error('Supplier options could not be loaded.');
+        const rows: SupplierOption[] = await response.json();
+        if (!controller.signal.aborted) setSupplierOptions({ company: selectedCompany, rows, error: false });
+      } catch {
+        if (!controller.signal.aborted) setSupplierOptions({ company: selectedCompany, rows: [], error: true });
+      }
+    })();
+    return () => controller.abort();
+  }, [API_BASE_URL, productModal.isOpen, selectedCompany]);
 
   const showToast = (message: string, type: 'success' | 'error') => {
     setToast({ message, type });
@@ -197,6 +237,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
       if (movRes.ok) setMovements(await movRes.json());
       if (whRes.ok) setWarehouses(await whRes.json());
       if (stkRes.ok) setHubStock(await stkRes.json());
+      setWarehouseStockAvailableFor(whRes.ok && stkRes.ok ? selectedCompany : null);
       if (poRes.ok) setPurchaseOrders(await poRes.json());
       if (grnRes?.ok) {
         setImportReceipts(await grnRes.json());
@@ -248,6 +289,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
       }
       setProducts(productsList);
     } catch (e) { 
+      setWarehouseStockAvailableFor(null);
       console.error("API Error", e); 
     }
   }, [API_BASE_URL, selectedCompany, selectedPricingTierFilter]);
@@ -348,6 +390,12 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
 
   const handleProductSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    const customFields = (productForm.customFields as ItemCustomField[]).filter(({ name, value }) => name.trim() || value.trim());
+    const customNames = new Set(customFields.map(({ name }) => name.trim()));
+    if (customNames.has('') || customNames.size !== customFields.length) {
+      showToast('Give each custom field a unique name.', 'error');
+      return;
+    }
     setIsProcessing(true);
     
     const cleanPayload: any = {
@@ -356,17 +404,29 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
       cmdn: productForm.cmdn || null, // <--- ADD THIS LINE
       category: productForm.category || 'General',
       purchasePrice: parseFloat(String(productForm.purchasePrice)) || 0,
-      sellingPrice: 0,
-      minQuantity: parseInt(String(productForm.minQuantity)) || 10,
-      reorderLevel: parseInt(String(productForm.reorderLevel)) || 20,
+      sellingPrice: parseFloat(String(productForm.sellingPrice)) || 0,
+      minQuantity: productForm.minQuantity === '' ? 10 : Number(productForm.minQuantity ?? 10),
+      reorderLevel: productForm.reorderLevel === '' ? 20 : Number(productForm.reorderLevel ?? 20),
       unit: productForm.unit || 'pcs',
+      isActive: productForm.isActive !== false,
       vatSetting: productForm.vatSetting || 'NONE',
       imageUrl: productForm.imageUrl || null,
       barcode: productForm.barcode || productForm.sku.toUpperCase(),
       company: selectedCompany,
+      manufacturerPartNumber: productForm.manufacturerPartNumber?.trim() || null,
+      purchaseDescription: productForm.purchaseDescription?.trim() || null,
+      salesDescription: productForm.salesDescription?.trim() || null,
+      preferredSupplierId: productForm.preferredSupplierId || null,
+      parentProductId: productForm.parentProductId ? Number(productForm.parentProductId) : null,
+      itemNotes: productForm.itemNotes?.trim() || null,
+      customFields: customFields.length ? Object.fromEntries(customFields.map(({ name, value }) => [name.trim(), value])) : null,
     };
 
-    if (!productModal.editingId) {
+    if (productModal.editingId) {
+      const current = products.find(({ id }) => id === productModal.editingId);
+      if (current && cleanPayload.parentProductId === (current.parentProductId ?? null)) delete cleanPayload.parentProductId;
+      if (current && cleanPayload.preferredSupplierId === (current.preferredSupplierId ?? null)) delete cleanPayload.preferredSupplierId;
+    } else {
       cleanPayload.initialQuantity = parseInt(String(productForm.initialQuantity)) || 0;
       cleanPayload.batchNumber = productForm.batchNumber || null;
       cleanPayload.expirationDate = productForm.expirationDate || null;
@@ -409,7 +469,10 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
           headers: { ...getApiAuthHeaders(), 'x-company': selectedCompany, 'Content-Type': 'application/json' },
           body: JSON.stringify(cleanPayload) 
         });
-        if (!res.ok) throw new Error(`Product sync failed (${res.status})`);
+        if (!res.ok) {
+          const failure = [400, 409].includes(res.status) ? await res.json().catch(() => null) : null;
+          throw new Error(typeof failure?.message === 'string' ? failure.message : `Product sync failed (${res.status})`);
+        }
         
         const resData = await res.json();
         const finalProductId = Number(productModal.editingId || resData.id || tempId);
@@ -816,12 +879,240 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
     });
   });
 
+  const renderProductEditor = (posting: ProductPostingFields = {}) => {
+    const editedProduct = products.find(({ id }) => id === productModal.editingId);
+    const suppliers = supplierOptions?.company === selectedCompany ? supplierOptions : null;
+    const vendorId = productForm.preferredSupplierId || '';
+    const parentId = Number(productForm.parentProductId) || '';
+    const parents = products.filter(({ id, deletedAt }) => id !== productModal.editingId && !deletedAt);
+    const quantity = productModal.editingId === null ? productForm.initialQuantity : editedProduct?.currentStock;
+    const sites = hubStock.filter(({ productId }) => productId === productModal.editingId);
+    const cost = Number(productForm.purchasePrice);
+    const price = Number(productForm.sellingPrice);
+    const hasPrices = productForm.purchasePrice !== '' && productForm.purchasePrice != null &&
+      productForm.sellingPrice !== '' && productForm.sellingPrice != null && Number.isFinite(cost) && Number.isFinite(price);
+    const markup = hasPrices && cost > 0 ? itemPercent.format((price - cost) / cost) : '—';
+    const margin = hasPrices && price > 0 ? itemPercent.format((price - cost) / price) : '—';
+    const customFields = productForm.customFields as ItemCustomField[];
+    const update = (field: string, value: unknown) => setProductForm((previous: typeof productForm) => ({ ...previous, [field]: value }));
+    const close = () => setProductModal({ isOpen: false, editingId: null });
+
+    return (
+      <form onSubmit={handleProductSubmit} className="item-editor-form">
+        <div className="item-editor-content">
+          <section className="item-editor-card" aria-labelledby="item-information-title">
+            <div className="item-editor-card-header">
+              <h3 id="item-information-title">Item information</h3>
+              <span className="item-editor-type">Inventory part</span>
+            </div>
+            <div className="item-editor-identity">
+              <div className="item-editor-fields">
+                <ItemField label="Item name" wide>
+                  <input required value={productForm.name} onChange={(e) => update('name', e.target.value)} />
+                </ItemField>
+                <ItemField label="Item number / SKU">
+                  <input required value={productForm.sku} onChange={(e) => update('sku', e.target.value)} />
+                </ItemField>
+                <ItemField label="Manufacturer’s part number">
+                  <input maxLength={100} value={productForm.manufacturerPartNumber ?? ''} onChange={(e) => update('manufacturerPartNumber', e.target.value)} />
+                </ItemField>
+                <ItemField label="Parent item">
+                  <select value={parentId} onChange={(e) => update('parentProductId', e.target.value)}>
+                    <option value="">No parent item</option>
+                    {!!parentId && !parents.some(({ id }) => id === parentId) && <option value={parentId}>Saved parent item</option>}
+                    {parents.map(({ id, sku, name }) => <option key={id} value={id}>{sku} · {name}</option>)}
+                  </select>
+                </ItemField>
+                <ItemField label="CMDN number">
+                  <input value={productForm.cmdn ?? ''} onChange={(e) => update('cmdn', e.target.value.toUpperCase())} />
+                </ItemField>
+                <div className="item-editor-category">
+                  <ItemField label="Category">
+                    <input list="category-options" value={productForm.category ?? ''} onChange={(e) => update('category', e.target.value)} />
+                  </ItemField>
+                  <button type="button" className="item-editor-secondary" onClick={() => update('category', '')}>Clear</button>
+                  <datalist id="category-options">
+                    <option value="General" />
+                    {uniqueCategories.filter((category) => category !== 'General').map((category) => <option key={category} value={category} />)}
+                  </datalist>
+                </div>
+                <ItemField label="Unit of measure">
+                  <input value={productForm.unit ?? ''} onChange={(e) => update('unit', e.target.value)} />
+                </ItemField>
+                <ItemField label="Barcode">
+                  <input value={productForm.barcode ?? ''} onChange={(e) => update('barcode', e.target.value)} />
+                </ItemField>
+              </div>
+              <div className="item-editor-image">
+                {productForm.imageUrl || productForm.previousImageUrl ? (
+                  <>
+                    <img src={productForm.imageUrl || productForm.previousImageUrl} alt="Product preview" />
+                    <button type="button" className="item-editor-secondary" onClick={() => {
+                      if (productForm.previousImageUrl) {
+                        deletedImageVault[productForm.sku] = productForm.previousImageUrl;
+                        delete globalImageVault[productForm.sku];
+                      }
+                      setProductForm((previous: typeof productForm) => ({ ...previous, imageUrl: null, previousImageUrl: '' }));
+                    }}>Remove image</button>
+                  </>
+                ) : (
+                  <>
+                    <span className="item-editor-empty-image">No image</span>
+                    {deletedImageVault[productForm.sku] && <button type="button" className="item-editor-secondary" onClick={() => {
+                      update('previousImageUrl', deletedImageVault[productForm.sku]);
+                      globalImageVault[productForm.sku] = deletedImageVault[productForm.sku];
+                    }}>Restore image</button>}
+                  </>
+                )}
+                <ItemField label="Product image"><input type="file" accept="image/*" onChange={handleModalImageUpload} /></ItemField>
+                <label className="item-editor-checkbox"><input type="checkbox" checked={productForm.isActive === false} onChange={(e) => update('isActive', !e.target.checked)} /> Item is inactive</label>
+              </div>
+            </div>
+          </section>
+
+          <div className="item-editor-purchase-sales">
+            <section className="item-editor-card" aria-labelledby="item-purchase-title">
+              <h3 id="item-purchase-title">Purchase information</h3>
+              <ItemField label="Purchase description">
+                <textarea rows={3} maxLength={2000} spellCheck value={productForm.purchaseDescription ?? ''} onChange={(e) => update('purchaseDescription', e.target.value)} />
+              </ItemField>
+              <div className="item-editor-fields">
+                <ItemField label="Cost price (₱)">
+                  <input required type="number" step="0.01" value={productForm.purchasePrice ?? ''} onChange={(e) => update('purchasePrice', e.target.value)} />
+                </ItemField>
+                <ItemField label="Preferred vendor">
+                  <select value={vendorId} disabled={!suppliers || suppliers.error} onChange={(e) => update('preferredSupplierId', e.target.value)}>
+                    <option value="">{!suppliers ? 'Loading suppliers…' : suppliers.error ? 'Supplier list unavailable' : 'No preferred vendor'}</option>
+                    {!!vendorId && !suppliers?.rows.some(({ id }) => id === vendorId) && <option value={vendorId}>Saved preferred vendor</option>}
+                    {suppliers?.rows.map(({ id, legalName, tradeName }) => <option key={id} value={id}>{tradeName && tradeName !== legalName ? `${tradeName} · ${legalName}` : legalName}</option>)}
+                  </select>
+                </ItemField>
+              </div>
+              {posting.cogsAccount}
+            </section>
+            <section className="item-editor-card" aria-labelledby="item-sales-title">
+              <h3 id="item-sales-title">Sales information</h3>
+              <ItemField label="Sales description">
+                <textarea rows={3} maxLength={2000} spellCheck value={productForm.salesDescription ?? ''} onChange={(e) => update('salesDescription', e.target.value)} />
+              </ItemField>
+              <div className="item-editor-fields">
+                <ItemField label="Sales price (₱)">
+                  <input type="number" step="0.01" value={productForm.sellingPrice ?? ''} onChange={(e) => update('sellingPrice', e.target.value)} />
+                </ItemField>
+                <ItemField label="VAT setting">
+                  <select value={productForm.vatSetting || 'NONE'} onChange={(e) => update('vatSetting', e.target.value)}>
+                    <option value="Vatable">Vatable</option>
+                    <option value="NONE">None</option>
+                    {!!productForm.vatSetting && !['NONE', 'Vatable'].includes(productForm.vatSetting) && <option value={productForm.vatSetting}>{productForm.vatSetting}</option>}
+                  </select>
+                </ItemField>
+              </div>
+              <dl className="item-editor-metrics">
+                <div><dt>Markup</dt><dd>{markup}</dd></div>
+                <div><dt>Margin</dt><dd>{margin}</dd></div>
+              </dl>
+              {posting.salesAccount}
+              {customerCategories.length > 0 && (
+                <details className="item-editor-disclosure">
+                  <summary>Customer category pricing overrides</summary>
+                  <div className="item-editor-fields">
+                    {customerCategories.map(({ id, name }) => (
+                      <ItemField key={id} label={`${name} tier price (₱)`}>
+                        <input type="number" step="0.01" value={productForm.categoryPrices?.[name] ?? ''} onChange={(e) => update('categoryPrices', { ...productForm.categoryPrices, [name]: e.target.value })} />
+                      </ItemField>
+                    ))}
+                  </div>
+                </details>
+              )}
+            </section>
+          </div>
+
+          <section className="item-editor-card" aria-labelledby="item-inventory-title">
+            <h3 id="item-inventory-title">Inventory information</h3>
+            <div className="item-editor-inventory">
+              <dl className="item-editor-stock">
+                <dt>Qty on hand</dt>
+                <dd>{quantity == null ? '—' : `${quantity.toLocaleString('en-PH')} ${editedProduct?.unit || productForm.unit || 'pcs'}`}</dd>
+                <dd className="item-editor-stock-source">Master Quantity</dd>
+              </dl>
+              <ItemField label="Reorder point">
+                <input type="number" min={0} step={1} value={productForm.reorderLevel ?? ''} onChange={(e) => update('reorderLevel', e.target.value)} />
+              </ItemField>
+              <ItemField label="Minimum quantity">
+                <input type="number" min={0} step={1} value={productForm.minQuantity ?? ''} onChange={(e) => update('minQuantity', e.target.value)} />
+              </ItemField>
+              {posting.inventoryAccount}
+            </div>
+            {editedProduct && (
+              <div className="item-editor-stock-details">
+                <details className="item-editor-disclosure">
+                  <summary>Inventory site info</summary>
+                  <dl className="item-editor-site-list">
+                    <div><dt>Master / Office</dt><dd>{editedProduct.currentStock.toLocaleString('en-PH')} {editedProduct.unit}</dd></div>
+                    {warehouseStockAvailableFor === selectedCompany && sites.map((site) => (
+                      <div key={site.id}>
+                        <dt>{warehouses.find(({ id }) => String(id) === String(site.warehouseId))?.name ?? `Warehouse ${site.warehouseId}`}</dt>
+                        <dd>{site.quantity.toLocaleString('en-PH')} {editedProduct.unit}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                  {warehouseStockAvailableFor !== selectedCompany ? <p>Warehouse quantities unavailable.</p> : sites.length === 0 && <p>No warehouse stock records for this item.</p>}
+                </details>
+                {canFinance && (
+                  <div className="item-editor-cost">
+                    <span>Approved landed cost</span>
+                    <strong>{editedProduct.landedCostReference == null ? '—' : money(editedProduct.landedCostReference, 6)}</strong>
+                    <button type="button" className="item-editor-secondary" onClick={() => setCostHistoryProduct(editedProduct)}>View cost history</button>
+                  </div>
+                )}
+              </div>
+            )}
+            {productModal.editingId === null && (
+              <details className="item-editor-disclosure">
+                <summary>Initial Master / Office receipt</summary>
+                <div className="item-editor-fields item-editor-three-fields">
+                  <ItemField label="Starting quantity"><input type="number" min={0} step={1} value={productForm.initialQuantity} onChange={(e) => update('initialQuantity', parseInt(e.target.value) || 0)} /></ItemField>
+                  <ItemField label="Batch number"><input value={productForm.batchNumber} onChange={(e) => update('batchNumber', e.target.value)} /></ItemField>
+                  <ItemField label="Expiration date"><input type="date" value={productForm.expirationDate} onChange={(e) => update('expirationDate', e.target.value)} /></ItemField>
+                </div>
+              </details>
+            )}
+          </section>
+
+          <section className="item-editor-card" aria-labelledby="item-additional-title">
+            <h3 id="item-additional-title">Additional details</h3>
+            <details className="item-editor-disclosure">
+              <summary>Item notes and custom fields</summary>
+              <ItemField label="Item notes"><textarea rows={3} maxLength={4000} spellCheck value={productForm.itemNotes ?? ''} onChange={(e) => update('itemNotes', e.target.value)} /></ItemField>
+              {customFields.map(({ name, value }, index) => (
+                <div className="item-editor-custom-field" key={index}>
+                  <ItemField label={`Field ${index + 1} name`}><input maxLength={60} value={name} onChange={(e) => update('customFields', customFields.map((field, position) => position === index ? { ...field, name: e.target.value } : field))} /></ItemField>
+                  <ItemField label={`Field ${index + 1} value`}><input maxLength={500} value={value} onChange={(e) => update('customFields', customFields.map((field, position) => position === index ? { ...field, value: e.target.value } : field))} /></ItemField>
+                  <button type="button" className="item-editor-secondary" aria-label={`Remove custom field ${index + 1}`} onClick={() => update('customFields', customFields.filter((_, position) => position !== index))}>Remove</button>
+                </div>
+              ))}
+              <button type="button" className="item-editor-secondary" disabled={customFields.length >= 12} onClick={() => update('customFields', [...customFields, { name: '', value: '' }])}>Add custom field</button>
+            </details>
+          </section>
+        </div>
+        <footer className="item-editor-footer">
+          <div>{posting.status}</div>
+          <div className="item-editor-actions">
+            <button type="button" className="item-editor-secondary" disabled={isProcessing} onClick={close}>Cancel</button>
+            {posting.save}
+            <button type="submit" className="item-editor-primary" disabled={isProcessing}>{isProcessing ? 'Saving…' : 'Save item'}</button>
+          </div>
+        </footer>
+      </form>
+    );
+  };
+
   return (
     <div className="directory-workspace catalog-workspace flex h-screen w-full bg-[#F8FAFC] font-sans text-slate-900 overflow-hidden">
       {canFinance && costHistoryProduct && <ProductCostHistory api={API_BASE_URL} company={selectedCompany} product={costHistoryProduct} onClose={() => setCostHistoryProduct(null)} />}
       
       {toast && (
-        <div className={`fixed bottom-6 right-6 z-[100] px-5 py-3.5 rounded-xl shadow-xl font-bold text-sm transition-all ${toast.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'}`}>
+        <div role={toast.type === 'error' ? 'alert' : 'status'} className={`fixed bottom-6 right-6 z-[220] px-5 py-3.5 rounded-xl shadow-xl font-bold text-sm transition-all ${toast.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'}`}>
           {toast.message}
         </div>
       )}
@@ -1066,7 +1357,7 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
                                     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
                                   </button>
                                   <div className="w-px h-4 bg-slate-200 mx-1"></div>
-                                  <button onClick={() => { setProductForm({ ...p, previousImageUrl: deletedImageVault[p.sku] || globalImageVault[p.sku] || '', categoryPrices: { ...(p.categoryPrices || {}) } }); setProductModal({ isOpen: true, editingId: p.id }); }} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors" title="Edit Product Specs">
+                                  <button onClick={() => { setProductForm({ ...p, previousImageUrl: deletedImageVault[p.sku] || globalImageVault[p.sku] || '', categoryPrices: { ...(p.categoryPrices || {}) }, customFields: Object.entries(p.customFields ?? {}).map(([name, value]) => ({ name, value })) }); setProductModal({ isOpen: true, editingId: p.id }); }} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors" title="Edit Product Specs">
                                     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
                                   </button>
                                   {isAuthorizedAdmin && (
@@ -1446,166 +1737,26 @@ export default function MasterInventory({ selectedCompany, loginUsername, API_BA
 
       {/* MODAL: ADD/EDIT PRODUCT */}
       {productModal.isOpen && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[150] flex items-center justify-center p-4">
-          <div className="bg-white rounded-3xl shadow-2xl w-full max-w-4xl max-h-[90vh] overflow-y-auto flex flex-col animate-in zoom-in-95 duration-200">
-            <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-white sticky top-0 z-20">
-              <h2 className="text-xl font-black text-slate-900 uppercase tracking-tight">{productModal.editingId ? 'Edit Master Record' : 'Register New Item'}</h2>
-              <button onClick={() => setProductModal({ isOpen: false, editingId: null })} className="p-2 text-slate-400 hover:text-rose-500 hover:bg-rose-50 rounded-full transition-colors">
-                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
-              </button>
-            </div>
-            <form onSubmit={handleProductSubmit} className="p-8 flex flex-col gap-8 bg-slate-50">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                
-                {/* IMAGE UPLOAD UI */}
-                <div className="md:col-span-2 flex items-center gap-6 bg-white p-4 border border-slate-200 rounded-2xl shadow-sm">
-                  <div className="relative group">
-                    {productForm.imageUrl || productForm.previousImageUrl ? (
-                      <>
-                        <img src={productForm.imageUrl || productForm.previousImageUrl} alt="Preview" className="w-20 h-20 rounded-xl object-cover border border-slate-200 shadow-sm" />
-                        <button 
-                          type="button" 
-                          onClick={() => {
-                            if (productForm.previousImageUrl) {
-                              deletedImageVault[productForm.sku] = productForm.previousImageUrl;
-                              delete globalImageVault[productForm.sku];
-                            }
-                            setProductForm((prev: any) => ({ ...prev, imageUrl: null, previousImageUrl: '' }));
-                          }} 
-                          className="absolute -top-2 -right-2 bg-rose-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-rose-600"
-                          title="Remove Image"
-                        >
-                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M6 18L18 6M6 6l12 12" /></svg>
-                        </button>
-                      </>
-                    ) : (
-                      <div className="flex flex-col items-center gap-2 shrink-0">
-                        <div className="w-20 h-20 rounded-xl bg-slate-100 border border-slate-200 border-dashed flex items-center justify-center text-[10px] font-bold text-slate-400 uppercase text-center">No Img</div>
-                     {deletedImageVault[productForm.sku] && (
-  <button 
-    type="button" 
-    onClick={() => {
-      // Restore image from deleted vault back to form and global vault
-      setProductForm((prev: any) => ({ ...prev, previousImageUrl: deletedImageVault[productForm.sku] }));
-      globalImageVault[productForm.sku] = deletedImageVault[productForm.sku];
-      delete deletedImageVault[productForm.sku];
-    }}
-    className="text-[9px] font-black text-sky-600 bg-sky-50 hover:bg-sky-100 px-3 py-1 rounded-md uppercase tracking-widest border border-sky-200 transition-colors shadow-sm"
-  >
-    Restore
-  </button>
-)}
-                      </div>
-                    )}
-                  </div>
-                  <div className="flex-1 flex flex-col gap-2">
-                    <label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Product Image</label>
-                    <input 
-                      type="file" 
-                      accept="image/*" 
-                      onChange={handleModalImageUpload} 
-                      className="text-sm font-medium text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-xs file:font-bold file:uppercase file:tracking-widest file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer"
-                    />
-                  </div>
-                </div>
-{/* NAME (Full Width) */}
-                <div className="flex flex-col gap-1.5 md:col-span-2"><label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Name *</label><input required type="text" value={productForm.name} onChange={e=>setProductForm((prev: any) => ({...prev, name: e.target.value}))} className="px-4 py-3 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" /></div>
-                
-                {/* SKU */}
-                <div className="flex flex-col gap-1.5"><label className="text-xs font-bold uppercase text-slate-500 tracking-wider">SKU *</label><input required type="text" value={productForm.sku} onChange={e=>setProductForm((prev: any) => ({...prev, sku: e.target.value}))} className="px-4 py-3 border border-slate-200 rounded-xl font-bold uppercase outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" /></div>
-                
-                {/* NEW CMDN INPUT (Auto-formats to Uppercase) */}
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-xs font-bold uppercase text-slate-500 tracking-wider">CMDN Number</label>
-                  <input type="text" placeholder="e.g. CMDN-12345" value={productForm.cmdn || ''} onChange={e => setProductForm((prev: any) => ({...prev, cmdn: e.target.value.toUpperCase()}))} className="px-4 py-3 border border-slate-200 rounded-xl font-bold uppercase outline-none focus:ring-2 focus:ring-fuchsia-500 shadow-sm text-fuchsia-900 placeholder:text-slate-300" />
-                </div>
-
-                {/* CATEGORY (With new 'Clear' button) */}
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Category</label>
-                  <div className="flex gap-2">
-                    <input 
-                      type="text" 
-                      list="category-options"
-                      placeholder="e.g. General"
-                      value={productForm.category || ''} 
-                      onChange={e => setProductForm((prev: any) => ({...prev, category: e.target.value}))} 
-                      className="w-full px-4 py-3 border border-slate-200 rounded-xl font-bold uppercase outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" 
-                    />
-                    <button type="button" onClick={() => setProductForm((prev: any) => ({...prev, category: ''}))} className="px-4 bg-slate-100 hover:bg-rose-100 text-slate-500 hover:text-rose-600 rounded-xl font-black uppercase text-[10px] transition-colors shadow-sm border border-slate-200 shrink-0">Clear</button>
-                  </div>
-                  <datalist id="category-options">
-                    <option value="General" />
-                    {uniqueCategories.filter(c => c !== 'General').map(cat => (
-                      <option key={cat} value={cat} />
-                    ))}
-                  </datalist>
-                </div>
-
-                {/* COST PRICE */}
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Cost Price (₱)</label>
-                  <div className="relative">
-                    <span className="absolute left-4 top-3 text-slate-400 font-bold">₱</span>
-                    <input required type="number" step="0.01" value={productForm.purchasePrice ?? ''} onChange={e=>setProductForm((prev: any) => ({...prev, purchasePrice: e.target.value}))} className="w-full pl-8 pr-4 py-3 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-blue-500 shadow-sm" />
-                  </div>
-                </div>
-                {/* DYNAMIC CATEGORY PRICING UI */}
-                {customerCategories.length > 0 && (
-                  <div className="md:col-span-2 mt-2">
-                     <h3 className="font-black text-slate-900 uppercase text-xs tracking-tight mb-3">Customer Category Pricing Overrides</h3>
-                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                       {customerCategories.map(cat => (
-                          <div key={cat.id} className="flex flex-col gap-1.5 p-3 bg-white border border-slate-200 rounded-xl shadow-sm">
-                            <label className="text-[10px] font-bold uppercase text-amber-600 tracking-wider">{cat.name} Tier Price</label>
-                            <div className="relative">
-                              <span className="absolute left-3 top-2 text-slate-400 font-bold text-xs">₱</span>
-                              <input 
-                                type="number" 
-                                step="0.01" 
-                                placeholder="Enter Price..."
-                                value={productForm.categoryPrices?.[cat.name] ?? ''} 
-                                onChange={e => {
-                                  setProductForm((prev: any) => ({
-                                    ...prev,
-                                    categoryPrices: {
-                                      ...(prev.categoryPrices || {}),
-                                      [cat.name]: e.target.value
-                                    }
-                                  }));
-                                }} 
-                                className="w-full pl-7 pr-3 py-2 border border-slate-200 rounded-lg text-sm font-bold outline-none focus:ring-2 focus:ring-amber-500 shadow-sm" 
-                              />
-                            </div>
-                          </div>
-                       ))}
-                     </div>
-                  </div>
-                )}
+        <div className="item-editor-overlay">
+          <div className="item-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="item-editor-title">
+            <header className="item-editor-header">
+              <div>
+                <h2 id="item-editor-title">{productModal.editingId === null ? 'Register new item' : 'Edit master record'}</h2>
+                {productModal.editingId !== null && <p>{productForm.sku} · {productForm.name}</p>}
               </div>
-              
-              {!productModal.editingId && (
-                <div className="p-6 bg-white border border-slate-200 rounded-2xl shadow-sm mt-2">
-                  <h3 className="font-black text-slate-900 uppercase mb-5 tracking-tight">Initial Master / Office Audit (Optional)</h3>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
-                    <div className="flex flex-col gap-1.5"><label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Starting Qty</label><input type="number" value={productForm.initialQuantity} onChange={e=>setProductForm((prev: any) => ({...prev, initialQuantity: parseInt(e.target.value) || 0}))} className="px-4 py-3 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-emerald-500 bg-emerald-50 text-emerald-900" /></div>
-                    <div className="flex flex-col gap-1.5"><label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Batch #</label><input type="text" value={productForm.batchNumber} onChange={e=>setProductForm((prev: any) => ({...prev, batchNumber: e.target.value}))} className="px-4 py-3 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-blue-500 uppercase" /></div>
-                    <div className="flex flex-col gap-1.5"><label className="text-xs font-bold uppercase text-slate-500 tracking-wider">Exp Date</label><input type="date" value={productForm.expirationDate} onChange={e=>setProductForm((prev: any) => ({...prev, expirationDate: e.target.value}))} className="px-4 py-3 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-blue-500 text-slate-700" /></div>
-                  </div>
-                </div>
-              )}
-              
-              <button type="submit" disabled={isProcessing} className="py-4 bg-slate-900 text-white rounded-xl font-black uppercase tracking-wider hover:bg-slate-800 transition-colors shadow-md disabled:opacity-50 mt-4">Save Master Record</button>
-            </form>
-            {canViewPostingAccounts && productModal.editingId !== null && (
+              <button type="button" className="item-editor-secondary item-editor-close" aria-label="Close product editor" disabled={isProcessing} onClick={() => setProductModal({ isOpen: false, editingId: null })}>×</button>
+            </header>
+            {canViewPostingAccounts && productModal.editingId !== null ? (
               <ProductPostingAccounts
                 key={JSON.stringify([selectedCompany, productModal.editingId])}
                 api={API_BASE_URL}
                 company={selectedCompany}
                 productId={productModal.editingId}
                 canWrite={canEditPostingAccounts}
-              />
-            )}
+              >
+                {renderProductEditor}
+              </ProductPostingAccounts>
+            ) : renderProductEditor()}
           </div>
         </div>
       )}
