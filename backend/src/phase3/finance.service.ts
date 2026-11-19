@@ -620,7 +620,12 @@ export class FinanceService implements OnModuleDestroy {
           company,
           id: { in: cumulative.map((item) => item.productId) },
         },
-        select: { id: true, purchasePrice: true, landedCostReference: true },
+        select: {
+          id: true,
+          purchasePrice: true,
+          landedCostReference: true,
+          salesDescription: true,
+        },
       });
       const items = cumulative.flatMap((item) => {
         const quantity =
@@ -653,7 +658,8 @@ export class FinanceService implements OnModuleDestroy {
           {
             productId: item.productId,
             sku: source[0].sku,
-            description: source[0].productName,
+            description:
+              product.salesDescription?.trim() || source[0].productName,
             quantity,
             unitPrice: source[0].unitPrice.toFixed(2),
             subtotal: subtotal.toFixed(2),

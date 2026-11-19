@@ -201,6 +201,16 @@ model Product {
   deletedAt     DateTime?
 
   cmdn String? @db.Text
+  manufacturerPartNumber String? @db.VarChar(100)
+  purchaseDescription String? @db.Text
+  salesDescription String? @db.Text
+  itemNotes String? @db.Text
+  customFields Json?
+  preferredSupplierId String?
+  preferredSupplier Supplier? @relation(fields: [preferredSupplierId], references: [id], onDelete: SetNull)
+  parentProductId Int?
+  parentProduct Product? @relation("ProductHierarchy", fields: [parentProductId], references: [id], onDelete: SetNull)
+  childProducts Product[] @relation("ProductHierarchy")
 
   quotationItems QuotationItem[]
   packingListItems PackingListItem[]
@@ -213,6 +223,8 @@ model Product {
 
   @@index([company])
   @@index([sku])
+  @@index([preferredSupplierId])
+  @@index([parentProductId])
 }
 
 model InventoryMovement {
@@ -431,6 +443,7 @@ model Supplier {
   catalog Json? @default("[]")
   supplierQuotations SupplierQuotation[]
   paymentRequests PaymentRequest[]
+  preferredProducts Product[]
 }
 
 model CustomerCategory {

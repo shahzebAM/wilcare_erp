@@ -89,6 +89,7 @@ describe('Phase 3 Finance service business safeguards', () => {
     },
     customer: { findFirst: jest.fn(), findMany: jest.fn() },
     delivery: { findMany: jest.fn(), findFirst: jest.fn() },
+    orderSlip: { findFirst: jest.fn() },
     supplier: { findFirst: jest.fn() },
     paymentRequest: {
       findFirst: jest.fn(),
@@ -96,7 +97,7 @@ describe('Phase 3 Finance service business safeguards', () => {
       update: jest.fn(),
     },
     landedCost: { findFirst: jest.fn(), update: jest.fn() },
-    product: { updateMany: jest.fn() },
+    product: { findMany: jest.fn(), updateMany: jest.fn() },
     productCostHistory: { create: jest.fn() },
   };
   let service: FinanceService;
@@ -260,6 +261,77 @@ describe('Phase 3 Finance service business safeguards', () => {
         }),
       ).rejects.toThrow('confirmed POD');
       expect(db.financeDocument.create).not.toHaveBeenCalled();
+    },
+  );
+  it.each([
+    ['  Sales line text  ', 'Sales line text'],
+    [null, 'Saved Final Order item'],
+    ['   ', 'Saved Final Order item'],
+  ])(
+    'snapshots the text for a new invoice when the catalogue sales description is %j',
+    async (salesDescription, expectedDescription) => {
+      db.delivery.findFirst.mockResolvedValue({
+        id: 'delivery-1',
+        delNumber: 'DEL-001',
+        status: 'Delivered',
+        order: { company: 'Test', customerId: 'customer-1' },
+        pods: [{ id: 'pod-1' }],
+        sources: [{ sourceId: 'fo-1', documentNumber: 'FO-001' }],
+        items: [{ productId: 1, deliveredQty: 2 }],
+      });
+      db.orderSlip.findFirst.mockResolvedValue({
+        id: 'fo-1',
+        osNumber: 'FO-001',
+        status: 'Generated',
+        vatApplied: true,
+        vatRate: d('0.12'),
+        items: [
+          {
+            productId: 1,
+            sku: 'ITEM-01',
+            productName: 'Saved Final Order item',
+            requestedQty: 2,
+            unitPrice: d('50.00'),
+          },
+        ],
+      });
+      db.product.findMany.mockResolvedValue([
+        {
+          id: 1,
+          salesDescription,
+          purchasePrice: 25,
+          landedCostReference: null,
+        },
+      ]);
+      const invoice = await service.invoiceFromDelivery('Test', actor(), {
+        deliveryId: 'delivery-1',
+        dueDate: '2099-12-31',
+      });
+      expect(invoice.data).toMatchObject({
+        items: [
+          {
+            productId: 1,
+            sku: 'ITEM-01',
+            description: expectedDescription,
+            quantity: 2,
+            unitPrice: '50.00',
+            subtotal: '100.00',
+            taxAmount: '12.00',
+            total: '112.00',
+            unitCost: '25.000000',
+          },
+        ],
+      });
+      db.financeDocument.findUnique.mockResolvedValue(invoice);
+      db.product.findMany.mockClear();
+      await expect(
+        service.invoiceFromDelivery('Test', actor(), {
+          deliveryId: 'delivery-1',
+          dueDate: '2099-12-31',
+        }),
+      ).resolves.toBe(invoice);
+      expect(db.product.findMany).not.toHaveBeenCalled();
+      expect(db.financeDocument.create).toHaveBeenCalledTimes(1);
     },
   );
   it('enforces approval limit before posting and leaves the document unchanged', async () => {

@@ -18,8 +18,21 @@ import {
   lockProduct,
   validateLocation,
 } from '../fulfillment/fulfillment.stock';
-import { object } from '../importation/importation.validation';
+import { integer, object, text } from '../importation/importation.validation';
 import { LegacyCompanyRecord, LegacyErpAccess, LegacyErpAuthGuard, LegacyReadModules } from '../auth/legacy-erp-auth.guard';
+
+const productTextFields = [
+  ['manufacturerPartNumber', 'Manufacturer part number', 100],
+  ['purchaseDescription', 'Purchase description', 2000],
+  ['salesDescription', 'Sales description', 2000],
+  ['itemNotes', 'Item notes', 4000],
+] as const;
+
+function catalogQuantity(value: unknown, fallback: number): number {
+  const quantity = parseInt(String(value));
+  return Number.isNaN(quantity) ? fallback : quantity;
+}
+
 @Controller() 
 @UseGuards(LegacyErpAuthGuard)
 @LegacyErpAccess('inventory')
@@ -38,36 +51,142 @@ export class MasterInventoryController {
     }
   }
 
+  private async productDetails(
+    tx: Prisma.TransactionClient,
+    company: string,
+    input: Record<string, unknown>,
+    productId?: number,
+  ) {
+    const details: Pick<
+      Prisma.ProductUncheckedCreateInput,
+      | (typeof productTextFields)[number][0]
+      | 'customFields'
+      | 'preferredSupplierId'
+      | 'parentProductId'
+      | 'isActive'
+    > = {};
+    for (const [key, label, maxLength] of productTextFields) {
+      const value = input[key];
+      if (value !== undefined) {
+        details[key] =
+          text(
+            typeof value === 'string' ? value.trim() : value,
+            label,
+            false,
+            maxLength,
+          ) ?? null;
+      }
+    }
+    if (input.customFields === null) {
+      details.customFields = Prisma.DbNull;
+    } else if (input.customFields !== undefined) {
+      const entries = Object.entries(object(input.customFields));
+      if (entries.length > 12)
+        throw new BadRequestException(
+          'An item can have at most 12 custom fields.',
+        );
+      const fields = new Map<string, string>();
+      for (const [key, value] of entries) {
+        const fieldName = text(key, 'Custom field name', true, 60)!;
+        if (fields.has(fieldName))
+          throw new BadRequestException('Custom field names must be distinct.');
+        if (typeof value !== 'string' || value.length > 500)
+          throw new BadRequestException(
+            'Custom field values must be text up to 500 characters.',
+          );
+        fields.set(fieldName, value);
+      }
+      details.customFields = Object.fromEntries(fields);
+    }
+    if (input.isActive !== undefined) {
+      if (typeof input.isActive !== 'boolean')
+        throw new BadRequestException(
+          'Item status must be active or inactive.',
+        );
+      details.isActive = input.isActive;
+    }
+    if (input.preferredSupplierId !== undefined) {
+      const supplierId =
+        text(input.preferredSupplierId, 'Preferred supplier', false, 100) ??
+        null;
+      if (
+        supplierId !== null &&
+        !(await tx.supplier.findFirst({
+          where: { id: supplierId, company },
+          select: { id: true },
+        }))
+      ) {
+        throw new BadRequestException(
+          'Preferred supplier not found in this workspace.',
+        );
+      }
+      details.preferredSupplierId = supplierId;
+    }
+    if (input.parentProductId !== undefined) {
+      const parentId =
+        input.parentProductId === null
+          ? null
+          : integer(input.parentProductId, 'Parent product', 1);
+      const visited = new Set<number>(
+        productId === undefined ? [] : [productId],
+      );
+      let ancestorId = parentId;
+      while (ancestorId !== null) {
+        if (visited.has(ancestorId))
+          throw new BadRequestException(
+            'A parent product cannot create an item hierarchy cycle.',
+          );
+        visited.add(ancestorId);
+        const ancestor = await tx.product.findFirst({
+          where: { id: ancestorId, company, deletedAt: null },
+          select: { parentProductId: true },
+        });
+        if (!ancestor)
+          throw new BadRequestException(
+            'Parent product not found in this workspace.',
+          );
+        ancestorId = ancestor.parentProductId;
+      }
+      details.parentProductId = parentId;
+    }
+    return details;
+  }
+
   // ==========================================
   // 1. PRODUCTS (Master Catalog)
   // ==========================================
   @Post('products')
   async createProduct(@Body() data: any) {
     try {
+      const input = object(data);
+      const company = text(input.company, 'Company', true, 100)!;
       return await this.prisma.$transaction(async (tx) => {
+        const details = await this.productDetails(tx, company, input);
         const product = await tx.product.create({
           data: {
-            company: data.company,
+            company,
             name: data.name,
             sku: data.sku,
             category: data.category || 'General',
             purchasePrice: parseFloat(data.purchasePrice) || 0,
             sellingPrice: parseFloat(data.sellingPrice) || 0,
-            minQuantity: parseInt(data.minQuantity) || 10,
-            reorderLevel: parseInt(data.reorderLevel) || 20,
+            minQuantity: catalogQuantity(input.minQuantity, 10),
+            reorderLevel: catalogQuantity(input.reorderLevel, 20),
             unit: data.unit || 'pcs',
             vatSetting: data.vatSetting || 'NONE',
             currentStock: parseInt(data.initialQuantity) || 0,
             imageUrl: data.imageUrl || null,
             barcode: data.barcode || null,
+            cmdn: typeof input.cmdn === 'string' ? input.cmdn : null,
             createdAt: data.createdAt ? new Date(data.createdAt) : new Date(),
+            ...details,
           }
         });
 
         if (data.initialQuantity && parseInt(data.initialQuantity) > 0) {
           await tx.inventoryMovement.create({
             data: {
-              company: data.company,
+              company,
               productId: product.id,
               productName: product.name,
               sku: product.sku,
@@ -87,6 +206,7 @@ export class MasterInventoryController {
         return product;
       });
     } catch (error: any) {
+      if (error instanceof BadRequestException) throw error;
       throw new Error(`Unified Product Creation Error: ${error.message}`);
     }
   }
@@ -96,6 +216,16 @@ export class MasterInventoryController {
   async findAllProducts(@Query('company') company: string) {
     if (!company) return [];
     return this.prisma.product.findMany({ where: { company }, orderBy: { id: 'desc' } });
+  }
+
+  @Get('products/supplier-options')
+  async productSupplierOptions(@Query('company') company: string) {
+    if (!company) return [];
+    return this.prisma.supplier.findMany({
+      where: { company },
+      orderBy: [{ legalName: 'asc' }, { id: 'asc' }],
+      select: { id: true, legalName: true, tradeName: true },
+    });
   }
 
   @Patch('products/:id')
@@ -115,6 +245,9 @@ export class MasterInventoryController {
     } = data;
     delete (cleanData as Record<string, unknown>).expiryControlled;
     delete (cleanData as Record<string, unknown>).serialControlled;
+    delete (cleanData as Record<string, unknown>).preferredSupplier;
+    delete (cleanData as Record<string, unknown>).parentProduct;
+    delete (cleanData as Record<string, unknown>).childProducts;
 
     if (cleanData.createdAt)
       cleanData.createdAt = new Date(cleanData.createdAt);
@@ -124,10 +257,11 @@ export class MasterInventoryController {
       cleanData.purchasePrice = parseFloat(cleanData.purchasePrice) || 0;
     if (cleanData.sellingPrice !== undefined)
       cleanData.sellingPrice = parseFloat(cleanData.sellingPrice) || 0;
-    if (cleanData.minQuantity !== undefined)
-      cleanData.minQuantity = parseInt(cleanData.minQuantity) || 10;
-    if (cleanData.reorderLevel !== undefined)
-      cleanData.reorderLevel = parseInt(cleanData.reorderLevel) || 20;
+    const input = object(cleanData);
+    if (input.minQuantity !== undefined)
+      input.minQuantity = catalogQuantity(input.minQuantity, 10);
+    if (input.reorderLevel !== undefined)
+      input.reorderLevel = catalogQuantity(input.reorderLevel, 20);
     return this.prisma.$transaction(
       async (tx) => {
         const product = await tx.product.findUnique({
@@ -140,6 +274,12 @@ export class MasterInventoryController {
             'A product cannot move to another workspace.',
           );
         }
+        const details = await this.productDetails(
+          tx,
+          product.company,
+          input,
+          product.id,
+        );
         if (currentStock !== undefined) {
           const quantity = Number(currentStock);
           if (
@@ -167,7 +307,7 @@ export class MasterInventoryController {
         }
         return tx.product.update({
           where: { id: product.id },
-          data: cleanData,
+          data: { ...input, ...details },
         });
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
