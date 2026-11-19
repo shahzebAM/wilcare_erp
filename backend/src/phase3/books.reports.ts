@@ -17,6 +17,112 @@ const Exact = Prisma.Decimal.clone({ precision: 50 });
 const D = (value: Prisma.Decimal.Value = 0) => new Exact(value);
 const DAY = 86400000;
 const OFFSET = 8 * 3600000;
+const trialBalanceColumns = [
+  'openingDebit',
+  'openingCredit',
+  'debit',
+  'credit',
+  'closingDebit',
+  'closingCredit',
+] as const;
+
+type ReportAccount = {
+  accountId: string;
+  code: string;
+  name: string;
+  type: string;
+};
+
+function groupReportAccounts<
+  Column extends string,
+  Row extends ReportAccount & Record<Column, string>,
+>(
+  accounts: Row[],
+  columns: readonly Column[],
+  parentIds: ReadonlyMap<string, string | null>,
+) {
+  const byId = new Map(accounts.map((row) => [row.accountId, row]));
+  const children = new Map<string, Row[]>();
+  const roots: Row[] = [];
+  for (const row of accounts) {
+    const parent = byId.get(parentIds.get(row.accountId) ?? '');
+    if (
+      !parent ||
+      parent.type !== row.type ||
+      parent.accountId === row.accountId
+    ) {
+      roots.push(row);
+      continue;
+    }
+    const siblings = children.get(parent.accountId) ?? [];
+    siblings.push(row);
+    children.set(parent.accountId, siblings);
+  }
+  if (!children.size) return { rows: accounts, accountSubtotals: [] };
+
+  type Hierarchy = {
+    depth: number;
+    accountPath: string;
+    parentAccountId: string | null;
+  };
+  const rows: (Row & Hierarchy)[] = [];
+  const subtotals = new Map<
+    string,
+    ReportAccount & Hierarchy & Record<Column, string>
+  >();
+  const seen = new Set<string>();
+  const visit = (
+    row: Row,
+    parent?: Row & Hierarchy,
+  ): ReturnType<typeof D>[] => {
+    seen.add(row.accountId);
+    const depth = parent ? parent.depth + 1 : 0;
+    const accountPath = parent
+      ? `${parent.accountPath} › ${row.name}`
+      : row.name;
+    const current = {
+      ...row,
+      depth,
+      accountPath,
+      parentAccountId: parent?.accountId ?? null,
+    };
+    rows.push(current);
+
+    const amounts = columns.map((column) => D(row[column]));
+    const nested = (children.get(row.accountId) ?? []).filter(
+      (child) => !seen.has(child.accountId),
+    );
+    for (const child of nested) {
+      visit(child, current).forEach((value, index) => {
+        amounts[index] = amounts[index].add(value);
+      });
+    }
+    if (nested.length) {
+      subtotals.set(row.accountId, {
+        accountId: row.accountId,
+        parentAccountId: current.parentAccountId,
+        code: row.code,
+        name: row.name,
+        type: row.type,
+        depth,
+        accountPath,
+        ...(Object.fromEntries(
+          columns.map((column, index) => [column, amounts[index].toFixed(2)]),
+        ) as Record<Column, string>),
+      });
+    }
+    return amounts;
+  };
+
+  // Retain direct balances even if inconsistent stored relationships form a cycle.
+  for (const row of [...roots, ...accounts]) {
+    if (!seen.has(row.accountId)) visit(row);
+  }
+  return {
+    rows,
+    accountSubtotals: rows.flatMap((row) => subtotals.get(row.accountId) ?? []),
+  };
+}
 
 export function reportPeriod(query: ReportQuery) {
   const from = parseIsoDate(query.from ?? query.asOf);
@@ -113,15 +219,8 @@ export async function financialReport(
           closingBalance: end.toFixed(2),
         };
       });
-      const total = (
-        column:
-          | 'debit'
-          | 'credit'
-          | 'openingDebit'
-          | 'openingCredit'
-          | 'closingDebit'
-          | 'closingCredit',
-      ) => rows.reduce((sum, row) => sum.add(row[column]), D()).toFixed(2);
+      const total = (column: (typeof trialBalanceColumns)[number]) =>
+        rows.reduce((sum, row) => sum.add(row[column]), D()).toFixed(2);
       const amount = (type: string, periodOnly = false) =>
         rows
           .filter((row) => row.type === type)
@@ -154,13 +253,16 @@ export async function financialReport(
           'Posted journal date; archived accounts included; full ledger totals',
         note: 'Ledger-only management report. Missing opening entries and manually posted closing entries affect results. No automatic opening/closing journals, legacy balances or payroll are added.',
       };
-      const allAccounts = accounts.map(({ id, code, name, active, type }) => ({
-        id,
-        code,
-        name,
-        active,
-        type,
-      }));
+      const allAccounts = accounts.map(
+        ({ id, code, name, active, type, parentAccountId }) => ({
+          id,
+          code,
+          name,
+          active,
+          type,
+          parentAccountId: parentAccountId ?? null,
+        }),
+      );
       if (kind === 'cash-flow')
         return {
           ...meta,
@@ -244,42 +346,55 @@ export async function financialReport(
           },
         };
       }
+      const parentIds = new Map(
+        allAccounts.map(({ id, parentAccountId }) => [id, parentAccountId]),
+      );
       if (kind === 'profit-loss')
         return {
           ...meta,
           accounts: allAccounts,
-          rows: rows
-            .filter((row) => ['REVENUE', 'EXPENSE'].includes(row.type))
-            .map((row) => ({
-              ...row,
-              amount: (row.type === 'REVENUE'
-                ? D(row.credit).minus(row.debit)
-                : D(row.debit).minus(row.credit)
-              ).toFixed(2),
-            })),
+          ...groupReportAccounts(
+            rows
+              .filter((row) => ['REVENUE', 'EXPENSE'].includes(row.type))
+              .map((row) => ({
+                ...row,
+                amount: (row.type === 'REVENUE'
+                  ? D(row.credit).minus(row.debit)
+                  : D(row.debit).minus(row.credit)
+                ).toFixed(2),
+              })),
+            ['amount'] as const,
+            parentIds,
+          ),
           totals: {
             revenue: revenue.toFixed(2),
             expenses: expenses.toFixed(2),
             profit: profit.toFixed(2),
           },
         };
-      if (kind === 'balance-sheet')
+      if (kind === 'balance-sheet') {
+        const grouped = groupReportAccounts(
+          rows
+            .filter((row) =>
+              ['ASSET', 'LIABILITY', 'EQUITY'].includes(row.type),
+            )
+            .map((row) => ({
+              ...row,
+              amount: (row.type === 'ASSET'
+                ? D(row.closingBalance)
+                : D(row.closingBalance).neg()
+              ).toFixed(2),
+            })),
+          ['amount'] as const,
+          parentIds,
+        );
         return {
           ...meta,
           accounts: allAccounts,
           asOf: period.toDay,
+          ...grouped,
           rows: [
-            ...rows
-              .filter((row) =>
-                ['ASSET', 'LIABILITY', 'EQUITY'].includes(row.type),
-              )
-              .map((row) => ({
-                ...row,
-                amount: (row.type === 'ASSET'
-                  ? D(row.closingBalance)
-                  : D(row.closingBalance).neg()
-                ).toFixed(2),
-              })),
+            ...grouped.rows,
             {
               code: '',
               name: 'Unclosed ledger earnings',
@@ -300,11 +415,12 @@ export async function financialReport(
               .toFixed(2),
           },
         };
+      }
       if (kind === 'trial-balance')
         return {
           ...meta,
           accounts: allAccounts,
-          rows,
+          ...groupReportAccounts(rows, trialBalanceColumns, parentIds),
           totals: {
             openingDebit: total('openingDebit'),
             openingCredit: total('openingCredit'),

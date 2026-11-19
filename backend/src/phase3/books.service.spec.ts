@@ -243,6 +243,218 @@ describe('Internal Books accounting safeguards', () => {
     expect(mockClient.$transaction).not.toHaveBeenCalled();
     expect(mockClient.ledgerAccount.create).not.toHaveBeenCalled();
   });
+  describe('account hierarchy', () => {
+    const account = {
+      id: 'supplies',
+      company: 'Surgicom',
+      code: '6110',
+      name: 'Office supplies',
+      type: 'EXPENSE',
+      active: true,
+      parentAccountId: null,
+      description: null,
+      note: null,
+    };
+    const parent = {
+      ...account,
+      id: 'office',
+      code: '6100',
+      name: 'Office expenses',
+    };
+    const subaccount = {
+      code: account.code,
+      name: account.name,
+      type: account.type,
+      parentAccountId: parent.id,
+      description: 'Stationery and supplies',
+      note: 'Managed by Finance',
+    };
+
+    beforeEach(() => {
+      mockClient.ledgerAccount.findUnique.mockResolvedValue(null);
+      mockClient.ledgerAccount.findFirst.mockResolvedValue(parent);
+      mockClient.ledgerAccount.findMany.mockResolvedValue([]);
+    });
+
+    it('creates a postable subaccount under a same-type active parent and records its metadata in the audit log', async () => {
+      const saved = { ...account, ...subaccount };
+      mockClient.ledgerAccount.create.mockResolvedValue(saved);
+      await expect(
+        service.createAccount('Surgicom', finance, subaccount),
+      ).resolves.toEqual(saved);
+      expect(mockClient.ledgerAccount.findFirst).toHaveBeenCalledWith(
+        containing({ where: { company: 'Surgicom', id: parent.id } }),
+      );
+      expect(mockClient.ledgerAccount.create).toHaveBeenCalledWith({
+        data: { company: 'Surgicom', ...subaccount },
+      });
+      expect(mockClient.erpAuditLog.create).toHaveBeenCalledWith(
+        containing({
+          data: containing({
+            action: 'CREATE',
+            entityId: account.id,
+            details: containing({
+              ...subaccount,
+              parentAccount: '6100 · Office expenses',
+            }),
+          }),
+        }),
+      );
+    });
+
+    it.each([
+      [{ ...parent, active: false }, 'active in this workspace'],
+      [{ ...parent, type: 'ASSET' }, 'same account type'],
+      [null, 'active in this workspace'],
+    ] as const)(
+      'rejects an unavailable or wrong-type parent %s',
+      async (candidate, message) => {
+        mockClient.ledgerAccount.findFirst.mockResolvedValue(candidate);
+        await expect(
+          service.createAccount('Surgicom', finance, subaccount),
+        ).rejects.toThrow(message);
+        expect(mockClient.ledgerAccount.create).not.toHaveBeenCalled();
+        expect(mockClient.erpAuditLog.create).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      [4, true],
+      [5, false],
+    ] as const)(
+      'checks the five-level limit with %s ancestors',
+      async (ancestors, accepted) => {
+        for (let index = 0; index < ancestors; index++) {
+          mockClient.ledgerAccount.findFirst.mockResolvedValueOnce({
+            ...parent,
+            parentAccountId: index + 1 < ancestors ? `ancestor-${index}` : null,
+          });
+        }
+        mockClient.ledgerAccount.create.mockResolvedValue(account);
+        const request = service.createAccount('Surgicom', finance, subaccount);
+        if (accepted) await expect(request).resolves.toEqual(account);
+        else await expect(request).rejects.toThrow('five levels');
+        expect(mockClient.ledgerAccount.findFirst).toHaveBeenCalledTimes(
+          ancestors,
+        );
+        expect(mockClient.ledgerAccount.create).toHaveBeenCalledTimes(
+          accepted ? 1 : 0,
+        );
+      },
+    );
+
+    it('moves an existing branch under a different parent without changing its ledger identity', async () => {
+      mockClient.ledgerAccount.findFirst
+        .mockResolvedValueOnce(account)
+        .mockResolvedValueOnce(parent);
+      mockClient.ledgerAccount.findMany.mockResolvedValueOnce([
+        { id: 'child' },
+      ]);
+      const update = {
+        parentAccountId: parent.id,
+        name: 'Renamed supplies',
+        description: 'New details',
+      };
+      const saved = { ...account, ...update };
+      mockClient.ledgerAccount.update.mockResolvedValue(saved);
+      await expect(
+        service.updateAccount('Surgicom', finance, account.id, update),
+      ).resolves.toEqual(saved);
+      expect(mockClient.ledgerAccount.update).toHaveBeenCalledWith({
+        where: { id: account.id },
+        data: update,
+      });
+      expect(mockClient.ledgerAccount.findMany).toHaveBeenCalledWith({
+        where: { company: 'Surgicom', parentAccountId: { in: ['child'] } },
+        select: { id: true },
+      });
+      expect(mockClient.erpAuditLog.create).toHaveBeenCalledWith(
+        containing({
+          data: containing({
+            action: 'UPDATE',
+            entityId: account.id,
+            details: containing({
+              previousParentAccountId: null,
+              parentAccountId: parent.id,
+            }),
+          }),
+        }),
+      );
+    });
+
+    it.each(['self', 'descendant'])(
+      'rejects picking %s as the parent before writing anything',
+      async (choice) => {
+        mockClient.ledgerAccount.findFirst.mockResolvedValueOnce(account);
+        if (choice === 'descendant') {
+          mockClient.ledgerAccount.findFirst.mockResolvedValueOnce({
+            ...parent,
+            parentAccountId: account.id,
+          });
+        }
+        const parentAccountId = choice === 'self' ? account.id : 'descendant';
+        await expect(
+          service.updateAccount('Surgicom', finance, account.id, {
+            parentAccountId,
+          }),
+        ).rejects.toThrow('own subaccounts');
+        expect(mockClient.ledgerAccount.update).not.toHaveBeenCalled();
+        expect(mockClient.erpAuditLog.create).not.toHaveBeenCalled();
+      },
+    );
+
+    it('rejects a moved branch if an archived or active descendant would exceed five levels', async () => {
+      mockClient.ledgerAccount.findFirst
+        .mockResolvedValueOnce(account)
+        .mockResolvedValueOnce(parent);
+      for (let index = 0; index < 4; index++)
+        mockClient.ledgerAccount.findMany.mockResolvedValueOnce([
+          { id: `child-${index}` },
+        ]);
+      await expect(
+        service.updateAccount('Surgicom', finance, account.id, {
+          parentAccountId: parent.id,
+        }),
+      ).rejects.toThrow('subaccounts beyond five levels');
+      expect(mockClient.ledgerAccount.update).not.toHaveBeenCalled();
+    });
+
+    it('can move a subaccount to the top level and clear metadata', async () => {
+      mockClient.ledgerAccount.findFirst.mockResolvedValueOnce({
+        ...account,
+        ...subaccount,
+      });
+      const changes = { parentAccountId: null, description: null, note: null };
+      await service.updateAccount('Surgicom', finance, account.id, changes);
+      expect(mockClient.ledgerAccount.update).toHaveBeenCalledWith({
+        where: { id: account.id },
+        data: changes,
+      });
+      expect(mockClient.ledgerAccount.findFirst).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects account code or type changes and restricts hierarchy edits to Books writers', async () => {
+      await expect(
+        service.updateAccount('Surgicom', finance, account.id, {
+          code: 'another',
+        }),
+      ).rejects.toThrow('code and type are fixed');
+      await expect(
+        service.updateAccount('Surgicom', finance, account.id, {
+          type: 'EQUITY',
+        }),
+      ).rejects.toThrow('code and type are fixed');
+      await expect(
+        service.updateAccount(
+          'Surgicom',
+          { ...finance, modules: { erpRoles: ['Auditor'], books: true } },
+          account.id,
+          { parentAccountId: parent.id },
+        ),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(mockClient.$transaction).not.toHaveBeenCalled();
+    });
+  });
   describe('chart of accounts deletion', () => {
     const unused = {
       id: 'custom-account',
@@ -251,7 +463,8 @@ describe('Internal Books accounting safeguards', () => {
       name: 'Unused office supplies',
       type: 'EXPENSE',
       active: true,
-      _count: { entries: 0, mappings: 0, reconciliations: 0 },
+      _count: { entries: 0, mappings: 0, reconciliations: 0, children: 0 },
+      children: [],
     };
     beforeEach(() => {
       mockClient.ledgerAccount.findFirst.mockResolvedValue(unused);
@@ -334,6 +547,32 @@ describe('Internal Books accounting safeguards', () => {
     it('archives an account used as an ACCOUNT reference mapping source', async () => {
       mockClient.accountingMapping.findFirst.mockResolvedValue({
         id: 'mapping-source',
+      });
+      await expect(
+        service.deleteAccount('Surgicom', superAdmin, unused.id),
+      ).resolves.toEqual({ id: unused.id, deleted: false, archived: true });
+      expect(mockClient.ledgerAccount.delete).not.toHaveBeenCalled();
+      expect(mockClient.ledgerAccount.update).toHaveBeenCalledWith({
+        where: { id: unused.id },
+        data: { active: false },
+      });
+    });
+    it('blocks deleting or archiving a parent with an active subaccount', async () => {
+      mockClient.ledgerAccount.findFirst.mockResolvedValue({
+        ...unused,
+        children: [{ id: 'subaccount' }],
+      });
+      await expect(
+        service.deleteAccount('Surgicom', superAdmin, unused.id),
+      ).rejects.toThrow('active subaccounts');
+      expect(mockClient.ledgerAccount.delete).not.toHaveBeenCalled();
+      expect(mockClient.ledgerAccount.update).not.toHaveBeenCalled();
+      expect(mockClient.erpAuditLog.create).not.toHaveBeenCalled();
+    });
+    it('archives a parent whose only references are archived subaccounts', async () => {
+      mockClient.ledgerAccount.findFirst.mockResolvedValue({
+        ...unused,
+        _count: { ...unused._count, children: 1 },
       });
       await expect(
         service.deleteAccount('Surgicom', superAdmin, unused.id),
@@ -469,6 +708,20 @@ describe('Internal Books accounting safeguards', () => {
       expect(mockClient.ledgerAccount.update).not.toHaveBeenCalled();
       expect(mockClient.erpAuditLog.create).not.toHaveBeenCalled();
     });
+    it('requires the active parent before restoring a subaccount', async () => {
+      mockClient.ledgerAccount.findFirst
+        .mockResolvedValueOnce({
+          ...unused,
+          active: false,
+          parentAccountId: 'archived-parent',
+        })
+        .mockResolvedValueOnce({ ...unused, active: false });
+      await expect(
+        service.restoreAccount('Surgicom', superAdmin, unused.id),
+      ).rejects.toThrow('active in this workspace');
+      expect(mockClient.ledgerAccount.update).not.toHaveBeenCalled();
+      expect(mockClient.erpAuditLog.create).not.toHaveBeenCalled();
+    });
     it.each(['Finance', 'Management', 'Auditor', 'Sales'])(
       'rejects restoration by a global Admin with ERP %s before opening a transaction',
       async (role) => {
@@ -525,20 +778,27 @@ describe('Internal Books accounting safeguards', () => {
       ...bank,
       code: '1000',
       name: 'Bank and cash',
-      _count: { entries: 0, mappings: 0, reconciliations: 0 },
+      parentAccountId: null,
+      _count: { entries: 0, mappings: 0, reconciliations: 0, children: 2 },
+      children: [{ id: 'mapped-source' }],
     };
     const archivedAccount = {
       ...activeAccount,
       id: 'archived-account',
       code: '1300',
       name: 'Accounts receivable',
+      parentAccountId: bank.id,
       active: false,
-      _count: { entries: 1, mappings: 1, reconciliations: 0 },
+      _count: { entries: 1, mappings: 1, reconciliations: 0, children: 0 },
+      children: [],
     };
     const mappedSource = {
       ...activeAccount,
       id: 'mapped-source',
       code: '6200',
+      parentAccountId: bank.id,
+      _count: { entries: 0, mappings: 0, reconciliations: 0, children: 0 },
+      children: [],
     };
     const journal = {
       id: 'journal-1',
@@ -569,14 +829,16 @@ describe('Internal Books accounting safeguards', () => {
       containing({ where: { company: 'Surgicom' } }),
     );
     expect(result.accounts).toEqual([
-      containing({ id: bank.id, active: true, deleteAction: 'DELETE' }),
+      containing({ id: bank.id, active: true, deleteAction: 'BLOCKED' }),
       containing({
         id: archivedAccount.id,
+        parentAccountId: bank.id,
         active: false,
         deleteAction: 'ARCHIVE',
       }),
       containing({ id: mappedSource.id, deleteAction: 'ARCHIVE' }),
     ]);
+    expect(result.accounts[0]).not.toHaveProperty('children');
     expect(result.trialBalance).toContainEqual(
       containing({
         accountId: archivedAccount.id,

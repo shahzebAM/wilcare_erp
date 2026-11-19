@@ -46,18 +46,31 @@ const accountTypes = [
   'REVENUE',
   'EXPENSE',
 ] as const;
+const accountLevels = 5;
 const accountUsageInclude = {
-  _count: { select: { entries: true, mappings: true, reconciliations: true } },
-} as const;
-function accountDeleteAction(
-  account: {
-    _count: { entries: number; mappings: number; reconciliations: number };
+  _count: {
+    select: {
+      entries: true,
+      mappings: true,
+      reconciliations: true,
+      children: true,
+    },
   },
+  children: { where: { active: true }, select: { id: true }, take: 1 },
+} as const;
+type AccountUsage = Prisma.LedgerAccountGetPayload<{
+  include: typeof accountUsageInclude;
+}>;
+
+function accountDeleteAction(
+  { _count, children }: Pick<AccountUsage, '_count' | 'children'>,
   isMappingSource: boolean,
-): 'DELETE' | 'ARCHIVE' {
-  return account._count.entries ||
-    account._count.mappings ||
-    account._count.reconciliations ||
+): 'DELETE' | 'ARCHIVE' | 'BLOCKED' {
+  if (children.length) return 'BLOCKED';
+  return _count.entries ||
+    _count.mappings ||
+    _count.reconciliations ||
+    _count.children ||
     isMappingSource
     ? 'ARCHIVE'
     : 'DELETE';
@@ -235,6 +248,77 @@ export class BooksService implements OnModuleDestroy {
     return account;
   }
 
+  private async validateAccountParent(
+    tx: Tx,
+    company: string,
+    type: string,
+    parentAccountId: string,
+    accountId?: string,
+  ) {
+    const seen = new Set(accountId ? [accountId] : []);
+    let ancestorId: string | null = parentAccountId;
+    let parent: { code: string; name: string } | undefined;
+    let parentDepth = 0;
+    while (ancestorId !== null) {
+      if (seen.has(ancestorId))
+        throw new BadRequestException(
+          'An account cannot be a subaccount of itself or one of its own subaccounts.',
+        );
+      seen.add(ancestorId);
+      const ancestor: {
+        code: string;
+        name: string;
+        active: boolean;
+        type: string;
+        parentAccountId: string | null;
+      } | null = await tx.ledgerAccount.findFirst({
+        where: { id: ancestorId, company },
+        select: {
+          code: true,
+          name: true,
+          active: true,
+          type: true,
+          parentAccountId: true,
+        },
+      });
+      if (!ancestor || !ancestor.active)
+        throw new BadRequestException(
+          'The parent account and its parents must be active in this workspace.',
+        );
+      if (ancestor.type !== type)
+        throw new BadRequestException(
+          'A subaccount must have the same account type as its parent.',
+        );
+      parent ??= { code: ancestor.code, name: ancestor.name };
+      ancestorId = ancestor.parentAccountId;
+      parentDepth++;
+      if (parentDepth >= accountLevels)
+        throw new BadRequestException(
+          'Accounts can be nested up to five levels.',
+        );
+    }
+
+    if (accountId) {
+      let levelIds = [accountId];
+      for (
+        let level = parentDepth + 1;
+        level <= accountLevels && levelIds.length;
+        level++
+      ) {
+        const children = await tx.ledgerAccount.findMany({
+          where: { company, parentAccountId: { in: levelIds } },
+          select: { id: true },
+        });
+        levelIds = children.map(({ id }) => id);
+      }
+      if (levelIds.length)
+        throw new BadRequestException(
+          'Moving this account would place its subaccounts beyond five levels.',
+        );
+    }
+    return parent;
+  }
+
   async overview(company: string) {
     return this.prisma.$transaction(
       async (tx) => {
@@ -253,7 +337,6 @@ export class BooksService implements OnModuleDestroy {
             where: { company },
             include: accountUsageInclude,
             orderBy: { code: 'asc' },
-            take: 1000,
           }),
           tx.accountingJournal.findMany({
             where: { company },
@@ -309,10 +392,10 @@ export class BooksService implements OnModuleDestroy {
           accountSources.map((row) => row.sourceId),
         );
         return {
-          accounts: accounts.map(({ _count, ...account }) => ({
+          accounts: accounts.map(({ _count, children, ...account }) => ({
             ...account,
             deleteAction: accountDeleteAction(
-              { ...account, _count },
+              { _count, children },
               mappingSources.has(account.id),
             ),
           })),
@@ -425,6 +508,14 @@ export class BooksService implements OnModuleDestroy {
       );
     const name = v.text(input.name, 'Account name', true, 200)!;
     const type = v.choice(input.type, accountTypes, 'account type');
+    const parentAccountId = v.text(
+      input.parentAccountId,
+      'Parent account',
+      false,
+      100,
+    );
+    const description = v.text(input.description, 'Description', false);
+    const note = v.text(input.note, 'Note', false);
     const reserved = DEFAULT_ACCOUNTS.find(
       ([systemCode]) => systemCode === code,
     );
@@ -441,15 +532,109 @@ export class BooksService implements OnModuleDestroy {
         throw new ConflictException(
           'This account code already exists in the workspace.',
         );
+      const parent = parentAccountId
+        ? await this.validateAccountParent(tx, company, type, parentAccountId)
+        : undefined;
       const account = await tx.ledgerAccount.create({
-        data: { company, code, name, type },
+        data: {
+          company,
+          code,
+          name,
+          type,
+          ...(parentAccountId ? { parentAccountId } : {}),
+          ...(description ? { description } : {}),
+          ...(note ? { note } : {}),
+        },
       });
       await audit(tx, company, actor, 'CREATE', 'LedgerAccount', account.id, {
         code,
         name,
         type,
+        ...(parent
+          ? {
+              parentAccountId,
+              parentAccount: `${parent.code} · ${parent.name}`,
+            }
+          : {}),
+        ...(description ? { description } : {}),
+        ...(note ? { note } : {}),
       });
       return account;
+    });
+  }
+
+  async updateAccount(
+    company: string,
+    actor: Actor,
+    id: string,
+    body: unknown,
+  ) {
+    const accountId = v.text(id, 'Account ID', true, 100)!;
+    const input = v.object(body);
+    if ('code' in input || 'type' in input)
+      throw new BadRequestException(
+        'An existing account code and type are fixed.',
+      );
+    const edits = {
+      name:
+        input.name === undefined
+          ? undefined
+          : v.text(input.name, 'Account name', true, 200),
+      parentAccountId:
+        input.parentAccountId === undefined
+          ? undefined
+          : (v.text(input.parentAccountId, 'Parent account', false, 100) ??
+            null),
+      description:
+        input.description === undefined
+          ? undefined
+          : (v.text(input.description, 'Description', false) ?? null),
+      note:
+        input.note === undefined
+          ? undefined
+          : (v.text(input.note, 'Note', false) ?? null),
+    };
+    return this.transaction(company, actor, async (tx) => {
+      const account = await this.account(tx, company, accountId);
+      const data = Object.fromEntries(
+        Object.entries(edits).filter(
+          ([key, value]) =>
+            value !== undefined && value !== account[key as keyof typeof edits],
+        ),
+      ) as Partial<{
+        name: string;
+        parentAccountId: string | null;
+        description: string | null;
+        note: string | null;
+      }>;
+      if (!Object.keys(data).length) return account;
+      const parent = data.parentAccountId
+        ? await this.validateAccountParent(
+            tx,
+            company,
+            account.type,
+            data.parentAccountId,
+            account.id,
+          )
+        : undefined;
+      const updated = await tx.ledgerAccount.update({
+        where: { id: account.id },
+        data,
+      });
+      await audit(tx, company, actor, 'UPDATE', 'LedgerAccount', account.id, {
+        code: account.code,
+        type: account.type,
+        ...data,
+        ...(data.parentAccountId !== undefined
+          ? {
+              previousParentAccountId: account.parentAccountId,
+              parentAccount: parent
+                ? `${parent.code} · ${parent.name}`
+                : 'Top-level account',
+            }
+          : {}),
+      });
+      return updated;
     });
   }
 
@@ -469,6 +654,10 @@ export class BooksService implements OnModuleDestroy {
           throw new NotFoundException('Account not found in this workspace.');
         if (!account.active)
           return { id: account.id, deleted: false, archived: true };
+        if (account.children.length)
+          throw new ConflictException(
+            'Move or archive the active subaccounts before removing this parent account.',
+          );
         const sourceMapping = await tx.accountingMapping.findFirst({
           where: { company, kind: 'ACCOUNT', sourceId: accountId },
           select: { id: true },
@@ -530,6 +719,13 @@ export class BooksService implements OnModuleDestroy {
       if (!account)
         throw new NotFoundException('Account not found in this workspace.');
       if (account.active) return { id: account.id, active: true };
+      if (account.parentAccountId)
+        await this.validateAccountParent(
+          tx,
+          company,
+          account.type,
+          account.parentAccountId,
+        );
       await tx.ledgerAccount.update({
         where: { id: account.id },
         data: { active: true },

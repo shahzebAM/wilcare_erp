@@ -1159,8 +1159,13 @@ model LedgerAccount {
   code String
   name String
   type String
+  parentAccountId String?
+  description String?
+  note String?
   active Boolean @default(true)
   createdAt DateTime @default(now())
+  parentAccount LedgerAccount? @relation("LedgerAccountHierarchy", fields: [parentAccountId, company], references: [id, company], onDelete: Restrict, onUpdate: Restrict)
+  children LedgerAccount[] @relation("LedgerAccountHierarchy")
   entries LedgerEntry[]
   mappings AccountingMapping[]
   reconciliations BankReconciliation[]
@@ -1168,6 +1173,7 @@ model LedgerAccount {
   cashClassifications CashFlowClassification[]
   @@unique([company, code])
   @@unique([id, company])
+  @@index([company, parentAccountId])
 }
 
 model AccountingJournal {

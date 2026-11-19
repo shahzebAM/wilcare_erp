@@ -6,6 +6,7 @@ import {
   Headers,
   Param,
   ParseIntPipe,
+  Patch,
   Post,
   Query,
   Req,
@@ -104,6 +105,16 @@ export class BooksController {
     @Param('id') id: string,
   ) {
     return this.books.deleteAccount(company, request.user, id);
+  }
+
+  @Patch('books/accounts/:id')
+  updateAccount(
+    @Headers('x-company') company: string,
+    @Req() request: Phase3Request,
+    @Param('id') id: string,
+    @Body() body: unknown,
+  ) {
+    return this.books.updateAccount(company, request.user, id, body);
   }
 
   @Post('books/accounts/:id/restore')
