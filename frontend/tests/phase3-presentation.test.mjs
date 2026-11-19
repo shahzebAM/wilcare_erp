@@ -42,7 +42,7 @@ function presentation({ query = '', executive } = {}) {
   const insights = load('InsightsWorkspace.tsx', {
     react,
     './shared': shared,
-    './FinancialReports': load('FinancialReports.tsx', { react, './shared': shared, './api': api }),
+    './FinancialReports': load('FinancialReports.tsx', { react, './shared': shared, './api': api, './accountHierarchy': load('accountHierarchy.ts', {}) }),
     './api': { ...api, usePhase3Data: () => ({ data: executive, loading: false, refresh: () => {} }) },
     '../../lib/phase3Access': {},
   });

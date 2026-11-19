@@ -1,5 +1,6 @@
 import { useState } from "react";
 import * as XLSX from "xlsx";
+import { accountHierarchy } from "./accountHierarchy";
 import { DataTable, Field, Form, Notice, Panel } from "./shared";
 import {
   formValue,
@@ -21,8 +22,9 @@ type Report = {
   basis: string;
   note: string;
   controlAccountScope?: string;
-  accounts: { id: string; code: string; name: string }[];
+  accounts: { id: string; code: string; name: string; parentAccountId?: string | null }[];
   rows: JsonRow[];
+  accountSubtotals?: JsonRow[];
   totals: Record<string, string | null>;
   complete?: boolean;
   configured?: boolean;
@@ -37,6 +39,20 @@ const kinds = [
   ["general-ledger", "General Ledger"],
   ["cash-flow", "Cash Flow"],
 ];
+
+function renderAccountCell(row: JsonRow, column: string) {
+  if (column !== "name" || typeof row.depth !== "number" || row.depth <= 0)
+    return;
+  return (
+    <span
+      className="block"
+      style={{ paddingInlineStart: row.depth * 16 }}
+      title={typeof row.accountPath === "string" ? row.accountPath : undefined}
+    >
+      {String(row.name)}
+    </span>
+  );
+}
 
 export function ReportMoney({ value }: { value: string | null }) {
   if (typeof value !== "string" || !/^-?\d+\.\d{2}$/.test(value))
@@ -104,6 +120,13 @@ export default function FinancialReports({
         XLSX.utils.json_to_sheet(result.rows),
         "Report",
       );
+      if (result.accountSubtotals?.length) {
+        XLSX.utils.book_append_sheet(
+          workbook,
+          XLSX.utils.json_to_sheet(result.accountSubtotals),
+          "Parent account subtotals",
+        );
+      }
       if (result.transferExceptions?.length) {
         XLSX.utils.book_append_sheet(
           workbook,
@@ -146,6 +169,15 @@ export default function FinancialReports({
       Math.abs(Number(row.expenses)),
     ]),
   );
+  const detailColumns =
+    kind === "general-ledger"
+      ? ["date", "number", "memo", "debit", "credit", "balance"]
+      : kind === "trial-balance"
+        ? [
+            "code", "name", "type", "openingDebit", "openingCredit",
+            "debit", "credit", "closingDebit", "closingCredit",
+          ]
+        : ["code", "name", "type", "amount"];
   return (
     <div className="space-y-5">
       <Panel
@@ -294,9 +326,9 @@ export default function FinancialReports({
                   }}
                 >
                   <option value="">Select account</option>
-                  {(summary?.accounts || []).map((account) => (
+                  {accountHierarchy(summary?.accounts ?? []).map((account) => (
                     <option key={account.id} value={account.id}>
-                      {account.code} · {account.name}
+                      {account.code} · {account.accountPath}
                     </option>
                   ))}
                 </select>
@@ -326,27 +358,28 @@ export default function FinancialReports({
               <p className="mb-3 text-sm text-slate-500">
                 {current.from} – {current.to} · {current.basis}
               </p>
+              {!!current.accountSubtotals?.length && (
+                <h3 className="mb-2 font-semibold">Account balances</h3>
+              )}
               <DataTable
                 rows={current.rows}
-                columns={
-                  kind === "general-ledger"
-                    ? ["date", "number", "memo", "debit", "credit", "balance"]
-                    : kind === "trial-balance"
-                      ? [
-                          "code",
-                          "name",
-                          "type",
-                          "openingDebit",
-                          "openingCredit",
-                          "debit",
-                          "credit",
-                          "closingDebit",
-                          "closingCredit",
-                        ]
-                      : ["code", "name", "type", "amount"]
-                }
+                columns={detailColumns}
                 searchLabel="Search report rows"
+                renderCell={renderAccountCell}
               />
+              {!!current.accountSubtotals?.length && (
+                <div className="my-4">
+                  <h3 className="mb-2 font-semibold">Parent account subtotals</h3>
+                  <p className="mb-2 text-sm text-slate-500">
+                    Each subtotal includes the parent account and its subaccounts.
+                  </p>
+                  <DataTable
+                    rows={current.accountSubtotals}
+                    columns={detailColumns}
+                    renderCell={renderAccountCell}
+                  />
+                </div>
+              )}
               <DataTable
                 rows={Object.entries(current.totals).map(
                   ([measure, amount]) => ({ measure, amount }),

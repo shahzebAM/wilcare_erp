@@ -30,7 +30,8 @@ function load(name, dependencies = {}, globals = {}) {
 const staticReact = { useState: (value) => [typeof value === 'function' ? value() : value, () => {}] };
 const api = load('api.ts', { react: staticReact, '../../lib/apiSession': {} });
 const shared = load('shared.tsx', { react: staticReact, './api': api });
-const reports = load('FinancialReports.tsx', { react: staticReact, './shared': shared, './api': api });
+const accountHierarchy = load('accountHierarchy.ts');
+const reports = load('FinancialReports.tsx', { react: staticReact, './shared': shared, './api': api, './accountHierarchy': accountHierarchy });
 
 const accounts = [
   { id: 'expense', code: '5000', name: 'Operating expenses', type: 'EXPENSE', active: true },
@@ -43,7 +44,7 @@ const sampleLines = () => [
   { code: '1000', debit: '', credit: '402.00', memo: 'Petty cash reimbursement' },
 ];
 
-function workspace({ lines = sampleLines(), journals = [], canWrite = true, busy = false, savedLayout, postResults = [] } = {}) {
+function workspace({ lines = sampleLines(), journals = [], chart = accounts, canWrite = true, canManageAccounts = false, busy = false, savedLayout, postResults = [] } = {}) {
   const values = [];
   const calls = [];
   const storage = { getItem: () => savedLayout, setItem: (key, value) => { savedLayout = value; storage.key = key; } };
@@ -63,7 +64,7 @@ function workspace({ lines = sampleLines(), journals = [], canWrite = true, busy
       return [values[slot], (next) => { values[slot] = typeof next === 'function' ? next(values[slot]) : next; }];
     },
   };
-  const data = { accounts, journals, mappings: [], reconciliations: [], trialBalance: [] };
+  const data = { accounts: chart, journals, mappings: [], reconciliations: [], trialBalance: [] };
   const component = load('BooksWorkspace.tsx', {
     react,
     './shared': shared,
@@ -72,6 +73,7 @@ function workspace({ lines = sampleLines(), journals = [], canWrite = true, busy
     './InventoryReconciliation': {},
     './AuditLog': {},
     './journalExport': {},
+    './accountHierarchy': accountHierarchy,
     './api': {
       ...api,
       formValue: (form, key) => String(form[key] ?? '').trim(),
@@ -89,7 +91,7 @@ function workspace({ lines = sampleLines(), journals = [], canWrite = true, busy
   }, { crypto, localStorage: storage });
   const tree = () => {
     cursor = 0;
-    return component.default({ api: 'http://test', company: 'Test', canWrite, canManageAccounts: false });
+    return component.default({ api: 'http://test', company: 'Test', canWrite, canManageAccounts });
   };
   return { tree, html: () => renderToStaticMarkup(tree()), calls, storage };
 }
@@ -108,6 +110,28 @@ const control = (ui, label) => {
   assert.ok(element, `Missing control: ${label}`);
   return element;
 };
+
+test('chart groups subaccounts and keeps their individual code and ID in posting selections', () => {
+  const parent = { ...accounts[0], deleteAction: 'BLOCKED' };
+  const child = { id: 'power', code: '5030', name: 'Power', type: 'EXPENSE', active: true, parentAccountId: parent.id };
+  const nested = { id: 'meter', code: '5015', name: 'Meter rental', type: 'EXPENSE', active: true, parentAccountId: child.id };
+  const chart = [nested, child, accounts[1], parent];
+  const ui = workspace({ chart, canManageAccounts: true });
+  const table = find(ui.tree(), (node) => node.type === shared.DataTable && node.props.searchLabel === 'Search accounts');
+  assert.deepEqual(Array.from(table.props.rows, ({ id }) => id), ['bank', 'expense', 'power', 'meter']);
+  const nestedRow = table.props.rows[3];
+  assert.equal(nestedRow.name, 'Operating expenses › Power › Meter rental');
+  assert.match(renderToStaticMarkup(table.props.renderCell(nestedRow, 'name')), /padding-inline-start:32px/);
+  const removeParent = find(table.props.actions(table.props.rows[1]), (node) => node.props?.['aria-label'] === 'Delete account 5000 Operating expenses');
+  assert.equal(removeParent.props.disabled, true);
+  const journalOption = find(control(ui, 'Account · line 1'), (node) => node.type === 'option' && node.props.value === '5015');
+  assert.match(renderToStaticMarkup(journalOption), /Operating expenses › Power › Meter rental/);
+
+  find(ui.tree(), (node) => node.type === 'button' && node.props.children === 'Account mappings').props.onClick();
+  const mappingSelect = find(ui.tree(), (node) => node.type === 'select' && node.props.name === 'accountId');
+  const mappingOption = find(mappingSelect, (node) => node.type === 'option' && node.props.value === 'meter');
+  assert.match(renderToStaticMarkup(mappingOption), /5015 · Operating expenses › Power › Meter rental/);
+});
 
 test('journal totals keep exact cents, empty sides and one-cent differences', () => {
   const { journalTotals } = api;

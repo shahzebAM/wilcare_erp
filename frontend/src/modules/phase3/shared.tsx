@@ -109,11 +109,13 @@ export function DataTable({
   columns,
   actions,
   searchLabel,
+  renderCell,
 }: {
   rows: JsonRow[];
   columns: string[];
   actions?: (row: JsonRow) => ReactNode;
   searchLabel?: string;
+  renderCell?: (row: JsonRow, column: string) => ReactNode;
 }) {
   const [query, setQuery] = useState('');
   const visibleRows =
@@ -163,14 +165,17 @@ export function DataTable({
         <tbody className="divide-y divide-slate-100">
           {visibleRows.map((row, index) => (
             <tr key={String(row.id || index)} className="hover:bg-slate-50">
-              {columns.map((column) => (
-                <td
-                  key={column}
-                  className="max-w-xs px-3 py-3 align-top break-words"
-                >
-                  {textValue(row[column])}
-                </td>
-              ))}
+              {columns.map((column) => {
+                const content = renderCell?.(row, column);
+                return (
+                  <td
+                    key={column}
+                    className="max-w-xs px-3 py-3 align-top break-words"
+                  >
+                    {content === undefined ? textValue(row[column]) : content}
+                  </td>
+                );
+              })}
               {actions && <td className="px-3 py-2">{actions(row)}</td>}
             </tr>
           ))}

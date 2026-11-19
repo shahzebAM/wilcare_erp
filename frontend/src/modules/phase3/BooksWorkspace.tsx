@@ -21,6 +21,7 @@ import CashFlowWorkspace from "./CashFlowWorkspace";
 import InventoryReconciliation from "./InventoryReconciliation";
 import { downloadJournal, printJournal } from "./journalExport";
 import AuditLog from "./AuditLog";
+import { accountHierarchy } from "./accountHierarchy";
 
 type Account = {
   id: string;
@@ -28,8 +29,119 @@ type Account = {
   name: string;
   type: string;
   active: boolean;
-  deleteAction?: "DELETE" | "ARCHIVE";
+  parentAccountId?: string | null;
+  description?: string | null;
+  note?: string | null;
+  deleteAction?: "DELETE" | "ARCHIVE" | "BLOCKED";
 };
+type ChartAccount = ReturnType<typeof accountHierarchy<Account>>[number];
+type AccountEditor = { account?: ChartAccount; parent?: ChartAccount };
+const accountTypes = {
+  ASSET: "Asset",
+  LIABILITY: "Liability",
+  EQUITY: "Equity",
+  REVENUE: "Revenue",
+  EXPENSE: "Expense",
+};
+const maxAccountLevels = 5;
+
+function LedgerAccountEditor({
+  editor, accounts, busy, error, save, close,
+}: {
+  editor: AccountEditor;
+  accounts: ChartAccount[];
+  busy: boolean;
+  error?: string;
+  save: (body: unknown) => Promise<boolean>;
+  close: () => void;
+}) {
+  const { account, parent } = editor;
+  const [draft, setDraft] = useState({
+    code: account?.code ?? "",
+    name: account?.name ?? "",
+    type: account?.type ?? parent?.type ?? "ASSET",
+    parentAccountId: account?.parentAccountId ?? parent?.id ?? "",
+    description: account?.description ?? "",
+    note: account?.note ?? "",
+  });
+  const [isSubaccount, setIsSubaccount] = useState(Boolean(draft.parentAccountId));
+  const update = (field: keyof typeof draft, value: string) => {
+    setDraft((previous) => ({ ...previous, [field]: value }));
+  };
+  const subtreeHeight = account ? accounts.reduce((height, row) =>
+    row.ancestorIds.includes(account.id) ? Math.max(height, row.depth - account.depth) : height, 0,
+  ) : 0;
+  const parentOptions = accounts.filter((row) =>
+    row.active && row.type === draft.type && row.id !== account?.id &&
+    (!account || !row.ancestorIds.includes(account.id)) &&
+    row.depth + 2 + subtreeHeight <= maxAccountLevels,
+  );
+  const selectedParent = parentOptions.find(({ id }) => id === draft.parentAccountId);
+  const parentIsValid = !isSubaccount || !!selectedParent;
+
+  return (
+    <form className="mb-5 space-y-4 rounded-lg border border-slate-200 bg-slate-50 p-4" aria-labelledby="ledger-account-editor-title" onSubmit={async (event) => {
+      event.preventDefault();
+      if (busy || !parentIsValid) return;
+      const saveAnother = (event.nativeEvent as SubmitEvent).submitter?.getAttribute("value") === "new";
+      const details = {
+        name: draft.name.trim(),
+        parentAccountId: isSubaccount ? draft.parentAccountId : null,
+        description: draft.description.trim() || null,
+        note: draft.note.trim() || null,
+      };
+      const ok = await save(account ? details : { ...details, code: draft.code.trim(), type: draft.type });
+      if (!ok) return;
+      if (saveAnother) setDraft((previous) => ({ ...previous, code: "", name: "", description: "", note: "" }));
+      else close();
+    }}>
+      <h3 id="ledger-account-editor-title" className="text-base font-semibold text-slate-900">{account ? "Edit ledger account" : parent ? "New subaccount" : "New ledger account"}</h3>
+      <Notice error={error} />
+      <fieldset disabled={busy} className="space-y-4">
+        <div className="grid gap-4 md:grid-cols-3">
+          <Field label="Account code">
+            <input required autoFocus={!account} readOnly={!!account} maxLength={30} className={input} value={draft.code} onChange={(event) => update("code", event.target.value)} />
+          </Field>
+          <Field label="Account name">
+            <input required autoFocus={!!account} maxLength={200} className={input} value={draft.name} onChange={(event) => update("name", event.target.value)} />
+          </Field>
+          <Field label="Account type">
+            <select disabled={!!account} className={input} value={draft.type} onChange={(event) => {
+              const type = event.target.value;
+              setDraft((previous) => ({ ...previous, type, parentAccountId: "" }));
+            }}>
+              {Object.entries(accountTypes).map(([type, label]) => <option key={type} value={type}>{label}</option>)}
+            </select>
+          </Field>
+        </div>
+        <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+          <input type="checkbox" checked={isSubaccount} onChange={(event) => setIsSubaccount(event.target.checked)} />
+          Subaccount of
+        </label>
+        {isSubaccount && (
+          <div className="space-y-1 md:max-w-xl">
+            <Field label="Parent account">
+              <select required className={input} value={selectedParent?.id ?? ""} onChange={(event) => update("parentAccountId", event.target.value)}>
+                <option value="">Select parent account</option>
+                {parentOptions.map((row) => <option key={row.id} value={row.id}>{row.code} · {row.accountPath}</option>)}
+              </select>
+            </Field>
+            <p className="text-xs text-slate-600">{parentOptions.length ? "Choose an active account of the same type." : "No eligible parent accounts are available for this account type and level."}</p>
+          </div>
+        )}
+        <div className="grid gap-4 md:grid-cols-2">
+          <Field label="Description (optional)"><textarea rows={2} maxLength={2000} className={input} value={draft.description} onChange={(event) => update("description", event.target.value)} /></Field>
+          <Field label="Note (optional)"><textarea rows={2} maxLength={2000} className={input} value={draft.note} onChange={(event) => update("note", event.target.value)} /></Field>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="submit" className={primary} disabled={!parentIsValid}>Save &amp; Close</button>
+          {!account && <button type="submit" value="new" className={secondary} disabled={!parentIsValid}>Save &amp; New</button>}
+          <button type="button" className={secondary} onClick={close}>Cancel</button>
+        </div>
+      </fieldset>
+    </form>
+  );
+}
 type Entry = {
   id: string;
   accountId: string;
@@ -113,7 +225,7 @@ function ReconciliationForm({
   busy,
   submit,
 }: {
-  accounts: Account[];
+  accounts: ChartAccount[];
   busy: boolean;
   submit: (body: unknown) => Promise<boolean>;
 }) {
@@ -190,7 +302,7 @@ function ReconciliationForm({
               .filter((account) => account.type === "ASSET")
               .map((account) => (
                 <option key={account.id} value={account.id}>
-                  {account.code} · {account.name}
+                  {account.code} · {account.accountPath}
                 </option>
               ))}
           </select>
@@ -314,6 +426,7 @@ export default function BooksWorkspace({
   const state = usePhase3Data<Books>(api, company, "/books");
   const [tab, setTab] = useState("ledger");
   const [showArchived, setShowArchived] = useState(false);
+  const [accountEditor, setAccountEditor] = useState<AccountEditor | null>(null);
   const [mappingKind, setMappingKind] = useState("ITEM");
   const [bankEntries, setBankEntries] = useState<Record<string, BankEntry[]>>(
     {},
@@ -334,8 +447,10 @@ export default function BooksWorkspace({
     Record<string, string>
   >({});
   const data = state.data;
-  const activeAccounts = (data?.accounts || []).filter((account) => account.active !== false);
-  const archivedAccounts = (data?.accounts || []).filter((account) => account.active === false);
+  const chartAccounts = accountHierarchy(data?.accounts ?? []);
+  const chartById = new Map(chartAccounts.map((account) => [account.id, account]));
+  const activeAccounts = chartAccounts.filter((account) => account.active !== false);
+  const archivedAccounts = chartAccounts.filter((account) => account.active === false);
   const totals = journalTotals(lines);
   const moveSection = (index: number, direction: -1 | 1) => {
     const position = index + direction;
@@ -394,7 +509,7 @@ export default function BooksWorkspace({
           Refresh
         </button>}
       </div>
-      <Notice {...state} />
+      <Notice {...state} error={tab === "ledger" && accountEditor ? undefined : state.error} />
       {tab === "reports" && <FinancialReports api={api} company={company} />}
       {tab === "cash-flow" && <CashFlowWorkspace api={api} company={company} canWrite={canWrite} />}
       {tab === "inventory-reconciliation" && canReconcileInventory && <InventoryReconciliation api={api} company={company} />}
@@ -429,19 +544,17 @@ export default function BooksWorkspace({
             title={ledgerSections.accounts}
             actions={
               canWrite && (
-                <button
-                  className={secondary}
-                  disabled={state.busy}
-                  onClick={() =>
-                    void state.run(
-                      "/books/initialize",
-                      {},
-                      "Default accounting accounts are ready.",
-                    )
-                  }
-                >
-                  Initialize standard accounts
-                </button>
+                <div className="flex flex-wrap gap-2">
+                  <button type="button" className={secondary} disabled={state.busy} onClick={() => void state.run("/books/initialize", {}, "Default accounting accounts are ready.")}>
+                    Initialize standard accounts
+                  </button>
+                  <button type="button" className={primary} disabled={state.busy || state.loading} aria-expanded={!!accountEditor} onClick={() => {
+                    setShowArchived(false);
+                    setAccountEditor({});
+                  }}>
+                    Add ledger account
+                  </button>
+                </div>
               )
             }
           >
@@ -461,22 +574,60 @@ export default function BooksWorkspace({
                 {showArchived ? "Show active accounts" : `Show archived accounts (${archivedAccounts.length})`}
               </button>
             </div>
+            {canWrite && accountEditor && (
+              <LedgerAccountEditor
+                key={accountEditor.account?.id ?? `new-${accountEditor.parent?.id ?? "root"}`}
+                editor={accountEditor}
+                accounts={chartAccounts}
+                busy={state.busy || state.loading}
+                error={state.error}
+                close={() => setAccountEditor(null)}
+                save={(body) => accountEditor.account
+                  ? state.run(`/books/accounts/${encodeURIComponent(accountEditor.account.id)}`, body, "Ledger account updated.", "PATCH")
+                  : state.run("/books/accounts", body, "Ledger account created.")}
+              />
+            )}
             <DataTable
               rows={(showArchived ? archivedAccounts : activeAccounts).map((account) => ({
                 ...account,
+                name: account.accountPath,
                 status: account.active === false ? "Archived" : "Active",
               }))}
               columns={["code", "name", "type", "status"]}
               searchLabel="Search accounts"
+              renderCell={(row, column) => {
+                const account = chartById.get(String(row.id));
+                if (column !== "name" || !account) return undefined;
+                return (
+                  <div style={{ paddingInlineStart: account.depth * 16 }} title={account.accountPath}>
+                    {account.depth > 0 && <span aria-hidden="true" className="mr-2 text-slate-500">↳</span>}
+                    {account.name}
+                    {account.description && <div className="mt-1 text-xs text-slate-600">{account.description}</div>}
+                    {showArchived && account.parentAccountId && <div className="mt-1 text-xs text-slate-600">{account.accountPath}</div>}
+                  </div>
+                );
+              }}
               actions={
-                canManageAccounts
-                  ? (account) => (
-                      <div className="space-y-1">
+                canWrite || canManageAccounts
+                  ? (row) => {
+                      const account = chartById.get(String(row.id));
+                      if (!account) return null;
+                      const blockedByChildren = account.active && account.deleteAction === "BLOCKED";
+                      const requiresParentRestore = !account.active && !!account.parentAccountId && chartById.get(account.parentAccountId)?.active !== true;
+                      return (
+                      <div className="flex flex-wrap items-center gap-2">
+                        {canWrite && account.active && (
+                          <>
+                            <button type="button" className={secondary} aria-label={`Edit account ${account.code} ${account.name}`} disabled={state.busy || state.loading} onClick={() => setAccountEditor({ account })}>Edit</button>
+                            {account.depth < maxAccountLevels - 1 && <button type="button" className={secondary} aria-label={`Add subaccount under ${account.code} ${account.name}`} disabled={state.busy || state.loading} onClick={() => setAccountEditor({ parent: account })}>Add subaccount</button>}
+                          </>
+                        )}
+                        {canManageAccounts && (
                         <button
                           type="button"
                           className={`${secondary} text-rose-700`}
                           aria-label={`${account.active === false ? "Restore" : "Delete"} account ${account.code} ${account.name}`}
-                          disabled={state.busy || state.loading}
+                          disabled={state.busy || state.loading || blockedByChildren || requiresParentRestore}
                           onClick={() => {
                             if (account.active === false) {
                               void state.run(
@@ -501,57 +652,16 @@ export default function BooksWorkspace({
                         >
                           {account.active === false ? "Restore" : "Delete"}
                         </button>
-                        {account.active !== false && account.deleteAction === "ARCHIVE" && (
-                          <p className="max-w-xs text-xs text-slate-500">
-                            Linked history will be preserved by archiving this account.
-                          </p>
                         )}
+                        {canManageAccounts && blockedByChildren && <p className="basis-full text-xs text-slate-600">Move or archive active subaccounts first.</p>}
+                        {canManageAccounts && account.active && account.deleteAction === "ARCHIVE" && <p className="basis-full text-xs text-slate-500">This account will be archived with its history.</p>}
+                        {canManageAccounts && requiresParentRestore && <p className="basis-full text-xs text-slate-600">Restore the parent account first.</p>}
                       </div>
-                    )
+                      );
+                    }
                   : undefined
               }
             />
-            {canWrite && (
-              <div className="mt-5">
-                <Form
-                  title="Add ledger account"
-                  disabled={state.busy}
-                  onSubmit={async (form) => {
-                    await state.run(
-                      "/books/accounts",
-                      {
-                        code: formValue(form, "code"),
-                        name: formValue(form, "name"),
-                        type: formValue(form, "type"),
-                      },
-                      "Ledger account created.",
-                    );
-                  }}
-                >
-                  <div className="grid gap-4 md:grid-cols-3">
-                    <Field label="Account code">
-                      <input required name="code" className={input} />
-                    </Field>
-                    <Field label="Account name">
-                      <input required name="name" className={input} />
-                    </Field>
-                    <Field label="Account type">
-                      <select name="type" className={input}>
-                        {[
-                          "ASSET",
-                          "LIABILITY",
-                          "EQUITY",
-                          "REVENUE",
-                          "EXPENSE",
-                        ].map((type) => (
-                          <option key={type}>{type}</option>
-                        ))}
-                      </select>
-                    </Field>
-                  </div>
-                </Form>
-              </div>
-            )}
           </Panel>,
           <Panel key="journals" title={ledgerSections.journals}>
             {canWrite && (
@@ -641,7 +751,7 @@ export default function BooksWorkspace({
                               <option value="">Select account</option>
                               {activeAccounts.map((account) => (
                                 <option key={account.id} value={account.code}>
-                                  {account.code} · {account.name}
+                                  {account.code} · {account.accountPath}
                                 </option>
                               ))}
                             </select>
@@ -840,7 +950,7 @@ export default function BooksWorkspace({
                     parties={(data.mappingSources?.[mappingKind] || []).map(
                       (source) => ({
                         id: String(source.id),
-                        name: `${source.sku || source.code || ""} ${source.name}`.trim(),
+                        name: `${source.sku || source.code || ""} ${mappingKind === "ACCOUNT" ? chartById.get(String(source.id))?.accountPath ?? source.name : source.name}`.trim(),
                       }),
                     )}
                   />
@@ -850,7 +960,7 @@ export default function BooksWorkspace({
                     <option value="">Select account</option>
                     {activeAccounts.map((account) => (
                       <option key={account.id} value={account.id}>
-                        {account.code} · {account.name}
+                        {account.code} · {account.accountPath}
                       </option>
                     ))}
                   </select>
@@ -862,9 +972,7 @@ export default function BooksWorkspace({
             <DataTable
               rows={data.mappings.map((mapping) => ({
                 ...mapping,
-                account: data.accounts.find(
-                  (account) => account.id === mapping.accountId,
-                )?.name,
+                account: chartById.get(String(mapping.accountId))?.accountPath,
               }))}
               columns={["kind", "sourceId", "account"]}
             />

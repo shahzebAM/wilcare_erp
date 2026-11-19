@@ -98,7 +98,7 @@ export async function phase3Request<T>(
   path: string,
   body?: unknown,
   signal?: AbortSignal,
-  method: 'GET' | 'POST' | 'DELETE' = body === undefined ? 'GET' : 'POST',
+  method: 'GET' | 'POST' | 'PATCH' | 'DELETE' = body === undefined ? 'GET' : 'POST',
 ): Promise<T> {
   const authHeaders = getApiAuthHeaders();
   const response = await fetch(`${api}/phase3${path}`, {
@@ -117,7 +117,7 @@ export async function phase3Request<T>(
   )
     expireApiSession();
   const result = await response.json().catch(() => null);
-  if (response.status === 404 && typeof result?.message === 'string' && /^Cannot (GET|POST|DELETE) /.test(result.message)) {
+  if (response.status === 404 && typeof result?.message === 'string' && /^Cannot (GET|POST|PATCH|DELETE) /.test(result.message)) {
     throw new Error('This feature is unavailable on the connected backend version. Deploy the matching backend and database updates, then refresh.');
   }
   if (!response.ok)
@@ -182,7 +182,7 @@ export function usePhase3Data<T>(
     endpoint: string,
     body: unknown,
     message: string,
-    method: 'POST' | 'DELETE' = 'POST',
+    method: 'POST' | 'PATCH' | 'DELETE' = 'POST',
     onSuccess?: (result: Result) => void,
   ): Promise<boolean> => {
     if (writing.current) return false;
